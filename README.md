@@ -45,6 +45,7 @@ day09 --help
 COMPETITION_API_URL=http://127.0.0.1:8081
 COMPETITION_TEAM_API_KEY=sk-team-your_key
 MCP_ENDPOINT=http://127.0.0.1:8001/mcp
+OPENAI_API_KEY=your_openai_api_key
 ```
 
 ## 3. Tải input
@@ -120,6 +121,8 @@ Triển khai tại:
 ```text
 src/student_agent/workflow.py
 ```
+
+`workflow.py` chỉ chứa điểm vào `solve_case()`. Coordinator, các specialist, Evidence Collector và Verifier nằm trong `src/student_agent/agents/`. Các agent sử dụng `gpt-4o-mini` cho quyết định có giới hạn mã trả về; output cuối vẫn phải qua JSON Schema trong `contracts/schemas/`.
 
 Hàm chính:
 

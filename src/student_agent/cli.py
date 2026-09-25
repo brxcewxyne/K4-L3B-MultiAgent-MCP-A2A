@@ -58,6 +58,7 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    validate_artifacts(root, case_set, contracts)
 
 
 def parser() -> argparse.ArgumentParser:
