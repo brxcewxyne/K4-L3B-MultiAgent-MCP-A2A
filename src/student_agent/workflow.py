@@ -149,24 +149,6 @@ def _forced_issue(proposal: ModelProposal, entity_status: str) -> str:
     if entity_status != "resolved":
         return "insufficient_evidence"
 
-    payment_map = {
-        "duplicate_capture": "duplicate_charge",
-        "capture_mismatch": "payment_mismatch",
-        "refund_pending": "refund_pending",
-        "refund_failed": "refund_failed",
-    }
-
-    if proposal.payment_verdict in payment_map:
-        return payment_map[proposal.payment_verdict]
-
-    shipment_map = {
-        "seller_delay": "late_delivery_seller",
-        "logistics_delay": "late_delivery_logistics",
-    }
-
-    if proposal.shipment_verdict in shipment_map:
-        return shipment_map[proposal.shipment_verdict]
-
     return proposal.primary_issue
 
 
@@ -323,13 +305,9 @@ def _build_output(
     elif not actions:
         actions = [ACTION_TEXT["INVESTIGATE_ENTITY"]]
 
-    late_seller_ids = (
-        seller_ids
-        if proposal.shipment_verdict == "seller_delay"
-        else [seller for seller in proposal.late_seller_ids if seller in seller_ids]
-    )
+    late_seller_ids = [seller for seller in proposal.late_seller_ids if seller in seller_ids]
 
-    known_party_ids = set(seller_ids + resolved_order_ids + customer_ids)
+    known_party_ids = set(seller_ids + resolved_order_ids + customer_ids + payment_refs + shipment_ids + item_ids)
 
     responsible_parties = [
         {
@@ -415,7 +393,9 @@ async def solve_case(
 
     candidates = list(dict.fromkeys(case.get("candidate_order_ids", [])))
     claimed = case.get("customer_request", {}).get("claimed_order_id")
-    if claimed and claimed not in candidates:
+    if claimed:
+        if claimed in candidates:
+            candidates.remove(claimed)
         candidates.insert(0, claimed)
 
     valid_candidates: list[str] = []
@@ -428,6 +408,8 @@ async def solve_case(
             )
             if _is_found(evidence.get("data"), candidate):
                 valid_candidates.append(candidate)
+                if candidate == claimed:
+                    break
         except RuntimeError as e:
             if "failed: Error executing tool" in str(e):
                 pass
@@ -457,21 +439,33 @@ async def solve_case(
         raise RuntimeError(f"unable to resolve an order for {case_id}")
 
     order_id = resolved_order_ids[0]
-    assignments = [
-        (
-            "customer-agent",
-            "get_customer_history",
-            {"customer_unique_id": case["customer_unique_id_hint"]},
-        ),
-        ("order-agent", "get_order_items", {"order_id": order_id}),
-        ("order-agent", "get_sellers", {"order_id": order_id}),
-        ("order-agent", "get_product_context", {"order_id": order_id}),
-        ("shipment-agent", "get_shipment_summary", {"order_id": order_id}),
-        ("payment-agent", "get_order_payments", {"order_id": order_id}),
-        ("payment-agent", "get_payment_timeline", {"order_id": order_id}),
-        ("payment-agent", "get_refund_timeline", {"order_id": order_id}),
-        ("policy-agent", "get_policy", {"policy_version": case["policy_version"]}),
-    ]
+    
+    investigation_scope = case.get("investigation_scope", {})
+    include_customer = investigation_scope.get("include_customer_history", False)
+    include_product = investigation_scope.get("include_product_context", False)
+
+    required_domains = set()
+    for claim in case["customer_request"]["claims"]:
+        required_domains.update(_relevant_domains(claim["topic"]))
+
+    assignments = []
+    if include_customer:
+        assignments.append(("customer-agent", "get_customer_history", {"customer_unique_id": case["customer_unique_id_hint"]}))
+    if "item" in required_domains:
+        assignments.append(("order-agent", "get_order_items", {"order_id": order_id}))
+    if "seller" in required_domains:
+        assignments.append(("order-agent", "get_sellers", {"order_id": order_id}))
+    if include_product:
+        assignments.append(("order-agent", "get_product_context", {"order_id": order_id}))
+    if "shipment" in required_domains:
+        assignments.append(("shipment-agent", "get_shipment_summary", {"order_id": order_id}))
+    if "payment" in required_domains:
+        assignments.append(("payment-agent", "get_order_payments", {"order_id": order_id}))
+        assignments.append(("payment-agent", "get_payment_timeline", {"order_id": order_id}))
+    if "refund" in required_domains:
+        assignments.append(("payment-agent", "get_refund_timeline", {"order_id": order_id}))
+    if "policy" in required_domains:
+        assignments.append(("policy-agent", "get_policy", {"policy_version": case["policy_version"]}))
 
     for actor, tool_name, arguments in assignments:
         trace.emit(

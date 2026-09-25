@@ -1,25 +1,66 @@
 import asyncio
-import os
 import json
-import httpx2
+import os
+from src.student_agent.contracts import Contracts
+from src.student_agent.mcp_gateway import connect_gateway
+from src.student_agent.trace import TraceWriter
+from src.student_agent.workflow import _is_found
 from dotenv import load_dotenv
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
 
-async def test():
+async def main():
+    from pathlib import Path
     load_dotenv()
-    headers = {"Authorization": f"Bearer {os.environ['COMPETITION_TEAM_API_KEY']}"}
-    timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
-    async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
-        streamable_http_client(os.environ["MCP_ENDPOINT"], http_client=http_client) as (read_stream, write_stream),
-        ClientSession(read_stream, write_stream) as session,
-    ):
-        await session.initialize()
-        print("Tools:", [tool.name for tool in (await session.list_tools()).tools])
-        
-        result = await session.call_tool("get_refund_timeline", arguments={"case_id": "L3B_CASE_001", "order_id": "af0bbb47f125381ce9f3597dc70ef07b"})
-        print("Result:", result)
+    contracts = Contracts(Path("contracts/schemas"))
+    with open("inputs/L3B_CASE_001.json") as f:
+        case = json.load(f)
+    
+    trace = TraceWriter(Path("traces/test.jsonl"), contracts=contracts)
+    async with connect_gateway(
+        os.environ["MCP_ENDPOINT"],
+        os.environ["COMPETITION_TEAM_API_KEY"],
+        contracts
+    ) as gateway:
+        print("Gateway connected")
+        try:
+            from src.student_agent.evidence_store import CaseEvidenceStore
+            store = CaseEvidenceStore(case_id=case["case_id"], gateway=gateway, trace=trace)
+            candidates = list(dict.fromkeys(case.get("candidate_order_ids", [])))
+            claimed = case.get("customer_request", {}).get("claimed_order_id")
+            if claimed:
+                if claimed in candidates:
+                    candidates.remove(claimed)
+                candidates.insert(0, claimed)
+
+            print("Candidates:", candidates)
+            valid_candidates = []
+            for candidate in candidates:
+                try:
+                    evidence = await gateway.call(
+                        "get_order",
+                        case_id=case["case_id"],
+                        order_id=candidate,
+                    )
+                    found = _is_found(evidence.get("data"), candidate)
+                    print(f"Candidate {candidate} found: {found}")
+                    if found:
+                        valid_candidates.append(candidate)
+                        if candidate == claimed:
+                            break
+                except RuntimeError as e:
+                    print(f"Candidate {candidate} error: {e}")
+
+            print("Valid:", valid_candidates)
+            resolved = (
+                [claimed]
+                if claimed in valid_candidates
+                else valid_candidates
+                if len(valid_candidates) == 1
+                else []
+            )
+            print("Resolved:", resolved)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(main())
