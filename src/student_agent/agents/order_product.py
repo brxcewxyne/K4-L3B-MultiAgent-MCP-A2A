@@ -44,6 +44,23 @@ def include_product_context(case: dict[str, Any]) -> bool:
     return False
 
 
+def _topics(case: dict[str, Any]) -> list[str]:
+    request = case.get("customer_request")
+    if isinstance(request, dict):
+        claims = request.get("claims")
+        if isinstance(claims, list):
+            return [str(c.get("topic")) for c in claims if isinstance(c, dict)]
+    return []
+
+
+def _needs_seller_records(case: dict[str, Any], seller_ids: list[str]) -> bool:
+    """get_order_items already yields seller IDs; fetch seller records only
+    when a seller-attribution decision may need them or IDs are still missing."""
+    if not seller_ids:
+        return True
+    return "late_delivery_seller" in _topics(case)
+
+
 async def run_order_product_agent(
     case: dict[str, Any],
     state: CaseState,
@@ -94,42 +111,54 @@ async def run_order_product_agent(
         }
 
     for order_id in resolved_order_ids:
-        for tool_name, container in (
-            ("get_order_items", ("items", "order_items", "orderItems", "rows")),
-            ("get_sellers", ("sellers", "seller_rows", "rows")),
-        ):
+        try:
+            evidence, _ = await consume_evidence(
+                state, gateway, trace,
+                actor=AGENT_NAME, tool_name="get_order_items",
+                case_id=case_id, order_id=order_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - partial failure, keep others
+            failed.append(f"get_order_items:{order_id}")
+            warnings.append(f"get_order_items failed for {order_id}: {type(exc).__name__}")
+            continue
+        ref = str(evidence["evidence_ref"])
+        if ref not in evidence_refs:
+            evidence_refs.append(ref)
+        data = evidence.get("data")
+        rows = _as_rows(data, "items", "order_items", "orderItems", "rows")
+        state.facts["items"][order_id] = data
+        for found in _collect_ids(rows, _ITEM_ID_KEYS):
+            if found not in item_ids:
+                item_ids.append(found)
+        for found in _collect_ids(rows, _SELLER_ID_KEYS):
+            if found not in seller_ids:
+                seller_ids.append(found)
+        for found in _collect_ids(rows, _PAYMENT_REF_KEYS):
+            if found not in payment_refs:
+                payment_refs.append(found)
+        for found in _collect_ids(rows, _SHIPMENT_ID_KEYS):
+            if found not in shipment_ids:
+                shipment_ids.append(found)
+
+        if _needs_seller_records(case, seller_ids):
             try:
                 evidence, _ = await consume_evidence(
                     state, gateway, trace,
-                    actor=AGENT_NAME, tool_name=tool_name,
+                    actor=AGENT_NAME, tool_name="get_sellers",
                     case_id=case_id, order_id=order_id,
                 )
-            except Exception as exc:  # noqa: BLE001 - partial failure, keep others
-                failed.append(f"{tool_name}:{order_id}")
-                warnings.append(f"{tool_name} failed for {order_id}: {type(exc).__name__}")
-                continue
-            ref = str(evidence["evidence_ref"])
-            if ref not in evidence_refs:
-                evidence_refs.append(ref)
-            data = evidence.get("data")
-            rows = _as_rows(data, *container)
-            if tool_name == "get_order_items":
-                state.facts["items"][order_id] = data
-                for found in _collect_ids(rows, _ITEM_ID_KEYS):
-                    if found not in item_ids:
-                        item_ids.append(found)
-                for found in _collect_ids(rows, _SELLER_ID_KEYS):
-                    if found not in seller_ids:
-                        seller_ids.append(found)
-                for found in _collect_ids(rows, _PAYMENT_REF_KEYS):
-                    if found not in payment_refs:
-                        payment_refs.append(found)
-                for found in _collect_ids(rows, _SHIPMENT_ID_KEYS):
-                    if found not in shipment_ids:
-                        shipment_ids.append(found)
+            except Exception as exc:  # noqa: BLE001 - seller records are auxiliary
+                failed.append(f"get_sellers:{order_id}")
+                warnings.append(f"get_sellers failed for {order_id}: {type(exc).__name__}")
             else:
-                state.facts["sellers"][order_id] = data
-                for found in _collect_ids(rows, _SELLER_ID_KEYS):
+                ref = str(evidence["evidence_ref"])
+                if ref not in evidence_refs:
+                    evidence_refs.append(ref)
+                seller_data = evidence.get("data")
+                state.facts["sellers"][order_id] = seller_data
+                for found in _collect_ids(
+                    _as_rows(seller_data, "sellers", "seller_rows", "rows"), _SELLER_ID_KEYS
+                ):
                     if found not in seller_ids:
                         seller_ids.append(found)
 

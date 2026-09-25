@@ -296,3 +296,30 @@ def test_final_trace_events(tmp_path: Path) -> None:
     consumed = [e for e in events if e["event_type"] == "tool_result_consumed"]
     for ref in output["evidence_refs"]:
         assert any(ref in (e.get("evidence_refs") or []) for e in consumed), ref
+
+
+def test_mocked_case_max_calls(tmp_path: Path) -> None:
+    gateway = _happy_gateway()
+    _solve(_happy_case(), gateway, tmp_path)
+    assert len(gateway.calls) <= 7, f"too many MCP calls: {len(gateway.calls)}"
+
+
+def test_calibration_fires_on_uncertainty(tmp_path: Path) -> None:
+    output = _solve(_happy_case(), _happy_gateway(), tmp_path)
+    assert output["assessment"]["confidence"] == 0.85
+    case = _happy_case()
+    del case["policy_version"]
+    output = _solve(case, _happy_gateway(), tmp_path)
+    assert output["assessment"]["confidence"] <= 0.55
+    assert output["assessment"]["case_status"] == "needs_investigation"
+
+
+def test_call_stats_track_cache_hits(tmp_path: Path) -> None:
+    from student_agent.evidence import fetch_evidence, new_case_state
+
+    gateway = _happy_gateway()
+    state = new_case_state({"case_id": "CASE_001"})
+    asyncio.run(fetch_evidence(state, gateway, "get_order", case_id="CASE_001", order_id="O1"))
+    asyncio.run(fetch_evidence(state, gateway, "get_order", case_id="CASE_001", order_id="O1"))
+    assert state.call_stats["mcp_calls"] == 1
+    assert state.call_stats["cache_hits"] == 1

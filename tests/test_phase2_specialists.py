@@ -97,9 +97,39 @@ def test_order_product_extracts_ids_and_reuses_order_cache(tmp_path: Path) -> No
     assert affected["order_ids"] == ["O1"]
     assert affected["item_ids"] == ["I1", "I2"]
     assert affected["seller_ids"] == ["S1"]
-    assert len(result["evidence_refs"]) == 3
+    assert len(result["evidence_refs"]) == 2
     assert result["status"] == "completed"
+    assert gateway.tools_called("get_sellers") == 0
     assert gateway.tools_called("get_order") == 0
+
+
+def test_order_product_calls_sellers_for_seller_claim(tmp_path: Path) -> None:
+    gateway = FakeGateway({
+        ("get_order_items", "O1"): ("item", {"items": [
+            {"item_id": "I1", "seller_id": "S1"},
+        ]}),
+        ("get_sellers", "O1"): ("seller", {"sellers": [{"seller_id": "S1"}]}),
+    })
+    case = _case(
+        customer_request={"claims": [{"claim_id": "c1", "topic": "late_delivery_seller"}]},
+        investigation_scope={"include_product_context": False},
+    )
+    state = new_case_state(case)
+    result = asyncio.run(run_order_product_agent(case, state, gateway, _trace(tmp_path), ["O1"]))
+    assert gateway.tools_called("get_sellers") == 1
+    assert result["facts"]["affected_entities"]["seller_ids"] == ["S1"]
+
+
+def test_order_product_calls_sellers_when_items_lack_ids(tmp_path: Path) -> None:
+    gateway = FakeGateway({
+        ("get_order_items", "O1"): ("item", {"items": [{"item_id": "I1"}]}),
+        ("get_sellers", "O1"): ("seller", {"sellers": [{"seller_id": "S9"}]}),
+    })
+    case = _case(investigation_scope={"include_product_context": False})
+    state = new_case_state(case)
+    result = asyncio.run(run_order_product_agent(case, state, gateway, _trace(tmp_path), ["O1"]))
+    assert gateway.tools_called("get_sellers") == 1
+    assert result["facts"]["affected_entities"]["seller_ids"] == ["S9"]
 
 
 def test_order_product_skips_product_context_when_scope_false(tmp_path: Path) -> None:
@@ -195,6 +225,16 @@ def test_shipment_conflicting(tmp_path: Path) -> None:
         "note": "parcel lost in transit",
     }, tmp_path)
     assert result["facts"]["verdict"] == "conflicting"
+
+
+def test_shipment_late_without_attribution_is_insufficient(tmp_path: Path) -> None:
+    result = _run_shipment({
+        "delivered_customer_at": "2018-02-10T10:00:00-03:00",
+        "estimated_delivery_at": "2018-02-05T10:00:00-03:00",
+    }, tmp_path)
+    assert result["facts"]["verdict"] == "insufficient_evidence"
+    assert result["facts"]["timeline_complete"] is False
+    assert result["facts"]["late_seller_ids"] == []
 
 
 # --- Payment/Refund ---
@@ -310,8 +350,7 @@ def test_payment_refunded(tmp_path: Path) -> None:
 
 
 def test_payment_refund_ask_alone_triggers_no_refund_call(tmp_path: Path) -> None:
-    """Live get_refund_timeline errors when no refund exists, so a bare
-    requested_full_refund ask must not trigger the call; policy decides it."""
+    """Bare requested_full_refund never triggers get_refund_timeline."""
     gateway = FakeGateway({
         ("get_order_payments", "O1"): ("payment", {"payments": [
             {"status": "paid", "payment_value": 80.0},
@@ -322,6 +361,36 @@ def test_payment_refund_ask_alone_triggers_no_refund_call(tmp_path: Path) -> Non
     result = asyncio.run(run_payment_refund_agent(case, state, gateway, _trace(tmp_path), ["O1"]))
     assert gateway.tools_called("get_refund_timeline") == 0
     assert result["facts"]["verdict"] == "reconciled"
+
+
+def test_payment_timeline_skipped_for_clean_installments(tmp_path: Path) -> None:
+    gateway = FakeGateway({
+        ("get_order_payments", "O1"): ("payment", {"payments": [
+            {"status": "paid", "payment_value": "44.50", "payment_sequential": "1"},
+            {"status": "paid", "payment_value": "44.50", "payment_sequential": "2"},
+        ]}),
+    })
+    state = new_case_state(_case())
+    result = asyncio.run(
+        run_payment_refund_agent(_case(), state, gateway, _trace(tmp_path), ["O1"])
+    )
+    assert gateway.tools_called("get_payment_timeline") == 0
+    assert result["facts"]["verdict"] == "reconciled"
+    assert result["facts"]["captured_total_brl"] == 89.0
+
+
+def test_payment_timeline_called_for_mismatch_claim(tmp_path: Path) -> None:
+    rows = [{"status": "paid", "payment_value": "50.00"}]
+    gateway = FakeGateway({
+        ("get_order_payments", "O1"): ("payment", {"payments": rows}),
+        ("get_payment_timeline", "O1"): ("payment", {"events": rows}),
+    })
+    case = _case(
+        customer_request={"claims": [{"claim_id": "c1", "topic": "payment_mismatch"}]},
+    )
+    state = new_case_state(case)
+    asyncio.run(run_payment_refund_agent(case, state, gateway, _trace(tmp_path), ["O1"]))
+    assert gateway.tools_called("get_payment_timeline") == 1
 
 
 # --- Isolation / harness / trace ---
@@ -340,7 +409,10 @@ def test_specialists_write_only_owned_domains(tmp_path: Path) -> None:
             {"status": "paid", "payment_value": 10.0},
         ]}),
     })
-    case = _case(investigation_scope={"include_product_context": False})
+    case = _case(
+        customer_request={"claims": [{"claim_id": "c1", "topic": "late_delivery_seller"}]},
+        investigation_scope={"include_product_context": False},
+    )
     state = new_case_state(case)
     asyncio.run(run_order_product_agent(case, state, gateway, _trace(tmp_path), ["O1"]))
     asyncio.run(run_shipment_agent(case, state, gateway, _trace(tmp_path), ["O1"]))

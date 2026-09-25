@@ -16,11 +16,22 @@ from .agents.verifier import run_verifier
 from .assemble import assert_no_internal_leak, build_output, build_unresolved_output
 from .evidence import CaseState, new_case_state
 from .mcp_gateway import EvidenceGateway
+from .reasoning import ModelSettings, ReasoningRouter
 from .trace import TraceWriter
 
 
+def build_router(root: Any = None) -> ReasoningRouter:
+    """One hybrid router per case. With no provider configured it returns
+    None-equivalent behavior: every router call resolves deterministically."""
+    return ReasoningRouter(ModelSettings.load(root))
+
+
 async def run_phase1_entity_resolution(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
+    case: dict[str, Any],
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    *,
+    router: ReasoningRouter | None = None,
 ) -> tuple[CaseState, dict[str, Any]]:
     """Internal Phase-1 harness: entity resolution only.
 
@@ -37,7 +48,7 @@ async def run_phase1_entity_resolution(
         actor="coordinator",
         target=AGENT_NAME,
     )
-    result = await run_entity_customer_agent(case, state, gateway, trace)
+    result = await run_entity_customer_agent(case, state, gateway, trace, router=router)
     trace.emit(
         case_id=case_id,
         event_type="handoff",
@@ -54,6 +65,7 @@ async def run_phase2_investigation(
     *,
     state: CaseState | None = None,
     phase1: dict[str, Any] | None = None,
+    router: ReasoningRouter | None = None,
 ) -> dict[str, Any]:
     """Internal Phase-2 harness: entity resolution then specialist fan-out.
 
@@ -88,7 +100,10 @@ async def run_phase2_investigation(
             actor="coordinator",
             target=agent_name,
         )
-        result = await runner(case, state, gateway, trace, resolved)
+        if key in ("shipment", "payment"):
+            result = await runner(case, state, gateway, trace, resolved, router=router)
+        else:
+            result = await runner(case, state, gateway, trace, resolved)
         trace.emit(
             case_id=case_id,
             event_type="handoff",
@@ -108,22 +123,27 @@ async def solve_case(
     → specialists → policy/conflict → assemble → verify → return.
     Emits ``policy_decided`` and ``verification_completed`` along the way.
     Never fabricates evidence; verifier downgrades instead of repairing.
+    A per-case hybrid router interprets genuine semantic ambiguity;
+    deterministic rules and the verifier keep final authority.
     """
     case_id = str(case.get("case_id", ""))
-    state, phase1 = await run_phase1_entity_resolution(case, gateway, trace)
+    router = build_router()
+    state, phase1 = await run_phase1_entity_resolution(case, gateway, trace, router=router)
     entity = phase1.get("entity", {})
     if not entity.get("resolved_order_ids"):
         output = build_unresolved_output(case, state, phase1)
         return _verify_and_close(case_id, output, state, case, trace)
 
-    bundle = await run_phase2_investigation(case, gateway, trace, state=state, phase1=phase1)
+    bundle = await run_phase2_investigation(
+        case, gateway, trace, state=state, phase1=phase1, router=router
+    )
     trace.emit(
         case_id=case_id,
         event_type="task_assigned",
         actor="coordinator",
         target=POLICY_AGENT,
     )
-    policy = await run_policy_conflict_agent(case, state, gateway, trace, bundle)
+    policy = await run_policy_conflict_agent(case, state, gateway, trace, bundle, router)
     trace.emit(
         case_id=case_id,
         event_type="handoff",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..evidence import CaseState, consume_evidence
+from ..reasoning import LABEL_MODEL_MIN_CONFIDENCE, PAYMENT_STATES
 
 AGENT_NAME = "payment-refund-agent"
 
@@ -18,8 +19,11 @@ _SUCCESS_MARKS = ("paid", "captured", "approved", "completed", "settled", "succe
 # does NOT trigger get_refund_timeline: live the tool errors when no refund
 # exists, so the call would only burn audited budget. Policy decides the ask.
 _REFUND_STATE_TOPICS = ("refund_pending", "refund_failed")
+# Timeline is confirmatory: rows alone decide clean installments/splits.
+# Call it only for lifecycle claim topics, unparseable amounts, or
+# pending/failed/refund signals in the rows themselves.
 _LIFECYCLE_CLAIM_TOPICS = (
-    "payment_mismatch", "valid_split_payment", "duplicate_charge",
+    "payment_mismatch", "duplicate_charge",
     "refund_pending", "refund_failed",
 )
 _ITEM_VALUE_KEYS = ("price", "freight_value", "freight", "item_price", "total_value")
@@ -81,6 +85,56 @@ def _round2(value: float) -> float:
     return round(value + 0.0, 2)
 
 
+def _has_known_mark(text: str) -> bool:
+    return any(
+        mark in text
+        for mark in _REFUND_STATUS_MARKS + _FAILED_MARKS + _PENDING_MARKS + _SUCCESS_MARKS
+    )
+
+
+_STATUS_TEXT_KEYS = ("status", "payment_status", "state", "event")
+
+
+def _status_text(row: dict[str, Any]) -> str:
+    """Status fields only: a bare payment_type is not an unknown status."""
+    parts: list[str] = []
+    for key in _STATUS_TEXT_KEYS:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip().lower())
+    return " ".join(parts)
+
+
+async def _classify_unknown_rows(
+    unknown: list[tuple[dict[str, Any], float, str]],
+    router: Any,
+    warnings: list[str],
+) -> dict[str, float]:
+    """Qwen-only interpretation of status texts deterministic rules miss.
+
+    Returns re-bucketed totals; failed/pending captures are excluded from
+    captured money rather than silently counted. Never touches MCP.
+    """
+    totals = {"captured": 0.0, "refunded": 0.0}
+    if router is None:
+        totals["captured"] = sum(amount for _, amount, _ in unknown)
+        return totals
+    distinct = sorted({text for _, _, text in unknown})
+    mapped = await router.interpret_label("payment", " | ".join(distinct), PAYMENT_STATES)
+    label = mapped.get("label") if mapped else None
+    confidence = float(mapped.get("model_confidence", 0.0)) if mapped else 0.0
+    if label not in PAYMENT_STATES or label == "unknown" or confidence < LABEL_MODEL_MIN_CONFIDENCE:
+        totals["captured"] = sum(amount for _, amount, _ in unknown)
+        return totals
+    if label == "refunded":
+        totals["refunded"] = sum(amount for _, amount, _ in unknown)
+    elif label == "paid_current":
+        totals["captured"] = sum(amount for _, amount, _ in unknown)
+    else:
+        warnings.append(f"model classified capture rows as {label}; excluded from totals.")
+    return totals
+
+
 def _row_identity(row: dict[str, Any]) -> tuple[str, str, str]:
     """Distinguish genuine installments/splits from repeated captures."""
     sequential = row.get("payment_sequential", row.get("sequential", ""))
@@ -120,11 +174,14 @@ async def run_payment_refund_agent(
     gateway: Any,
     trace: Any,
     resolved_order_ids: list[str] | None = None,
+    router: Any | None = None,
 ) -> dict[str, Any]:
     """Collect payment/refund evidence and compute totals in Python.
 
     ``refundable_total_brl`` stays ``None``: entitlement needs the Phase-3
-    policy decision, so no policy-authorized value is invented here.
+    policy decision, so no policy-authorized value is invented here. An
+    optional hybrid `router` interprets status texts deterministic rules miss;
+    arithmetic and verdicts stay deterministic.
     """
     case_id = str(case.get("case_id", state.case_id))
     if resolved_order_ids is None:
@@ -190,6 +247,7 @@ async def run_payment_refund_agent(
         seen_payment = True
         amounts: list[float] = []
         identities: list[tuple[str, str, str]] = []
+        unknown_rows: list[tuple[dict[str, Any], float, str]] = []
         for row in rows:
             amount = _amount_of(row)
             if amount is None:
@@ -197,12 +255,21 @@ async def run_payment_refund_agent(
             amounts.append(amount)
             identities.append(_row_identity(row))
             text = _row_text(row)
+            if _status_text(row) and not _has_known_mark(_status_text(row)):
+                unknown_rows.append((row, amount, _status_text(row)))
+                continue
             is_refund_row = any(mark in text for mark in _REFUND_STATUS_MARKS)
             if is_refund_row:
                 refunded_total += amount
                 seen_refund_data = True
             else:
                 captured_total += amount
+        if unknown_rows:
+            rebucket = await _classify_unknown_rows(unknown_rows, router, warnings)
+            captured_total += rebucket["captured"]
+            if rebucket["refunded"] > 0:
+                refunded_total += rebucket["refunded"]
+                seen_refund_data = True
         repeated = len(amounts) != len({round(a, 2) for a in amounts}) and len(amounts) > 1
         if repeated:
             # Installment splits share one total; true duplicates overcharge it.
@@ -214,11 +281,11 @@ async def run_payment_refund_agent(
                 duplicate_amounts = True
 
         needs_timeline = (
-            len(rows) > 1
-            or any(topic in _LIFECYCLE_CLAIM_TOPICS for topic in topics)
+            any(topic in _LIFECYCLE_CLAIM_TOPICS for topic in topics)
             or not amounts
             or any(
-                any(mark in _row_text(row) for mark in _PENDING_MARKS + _FAILED_MARKS)
+                any(mark in _row_text(row)
+                    for mark in _PENDING_MARKS + _FAILED_MARKS + _REFUND_STATUS_MARKS)
                 for row in rows
             )
         )

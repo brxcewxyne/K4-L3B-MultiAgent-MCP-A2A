@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..evidence import CaseState, fetch_evidence
+from ..reasoning import ENTITY_MODEL_MIN_CONFIDENCE
 
 AGENT_NAME = "entity-customer-agent"
 
@@ -135,8 +136,14 @@ async def run_entity_customer_agent(
     gateway: Any,
     trace: Any,
     ranker: Callable[[list[dict[str, Any]]], int | None] | None = None,
+    router: Any | None = None,
 ) -> dict[str, Any]:
-    """Deterministic entity/customer resolution. LLM `ranker` is advisory only."""
+    """Deterministic entity/customer resolution first.
+
+    `ranker` (explicit callable) wins when given. Otherwise, when several
+    candidates remain plausible, an optional hybrid `router` may rank the
+    evidence-backed shortlist; invented IDs are rejected and ambiguity kept.
+    """
     case_id = str(case.get("case_id", state.case_id))
     claimed = extract_claimed_order_id(case)
     candidates = extract_candidate_order_ids(case)
@@ -262,6 +269,30 @@ async def run_entity_customer_agent(
                 "resolution_code": "advisory_only",
             })
             warnings.append("LLM suggestion recorded as advisory; status stays ambiguous.")
+    elif ranker is None and router is not None and status == "ambiguous" and len(strong) > 1:
+        summaries = [
+            {
+                "order_id": order_id,
+                "customer_match": hint is not None
+                and order_customers.get(order_id) == hint,
+                "in_history": order_id in history_order_ids,
+            }
+            for order_id in strong
+        ]
+        ranked = await router.rank_entity_candidates(summaries, list(strong))
+        if (
+            ranked is not None
+            and not ranked["ambiguous"]
+            and ranked["selected_order_id"] in strong
+            and ranked["model_confidence"] >= ENTITY_MODEL_MIN_CONFIDENCE
+        ):
+            status = "resolved"
+            resolved = [ranked["selected_order_id"]]
+            confidence = 0.75
+            customer_unique_id = (
+                order_customers.get(resolved[0]) or history_customer
+            )
+            warnings.append("model-assisted ranking among evidence-backed candidates.")
 
     rejected = [c for c in candidates if c not in resolved]
 

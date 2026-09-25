@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..evidence import CaseState, consume_evidence
+from ..reasoning import POLICY_MODEL_MIN_CONFIDENCE
 
 AGENT_NAME = "policy-conflict-agent"
 
@@ -135,7 +136,7 @@ def assess_claim(
             return done("unsupported", 0.75)
         if remaining is not None and recommended_refund >= remaining - 0.01:
             return done("supported", 0.8)
-        return done("partially_supported", 0.7)
+        return done("partially_supported", 0.6)
     if topic == "payment_mismatch":
         if payment_verdict == "capture_mismatch":
             return done("supported", 0.85)
@@ -193,7 +194,19 @@ def select_primary_issue(
     claim_assessments: list[dict[str, Any]],
     claims: list[dict[str, Any]],
 ) -> tuple[str, list[str]]:
-    """Evidence-first primary selection; customer topics never copied blindly."""
+    """Evidence-first primary selection; customer topics never copied blindly.
+
+    Priority (first match wins), each step requires authoritative evidence:
+    1. duplicate_capture / capture_mismatch / refund_failed: money-integrity
+       faults dominate because they invalidate every downstream remedy.
+    2. canceled/unavailable + captured>0: terminal order state with money held.
+    3. seller_delay / logistics_delay / lost / returned: attributable delivery
+       failure outranks a mere pending refund or a clean split.
+    4. refund_pending: remedy-state issue once delivery/payment are clean.
+    5. valid_split_payment: only with reconciled multi-row evidence + claim.
+    6. unsupported_claim: claims exist but evidence rejects all of them.
+    7. insufficient_evidence: nothing sufficiently supported.
+    """
     topic_of = {str(c.get("claim_id")): str(c.get("topic", "")) for c in claims}
     topics = list(topic_of.values())
     supported_ids = {
@@ -254,34 +267,59 @@ def calibrate_confidence(
     *,
     entity_status: str | None,
     primary_issue: str,
-    missing_evidence: bool,
-    unresolved_conflict: bool,
-    timeline_complete: bool,
-    policy_ambiguous: bool,
-    partial_evidence: bool,
+    case_status: str | None = None,
+    model_confidence: float | None = None,
+    missing_evidence: bool = False,
+    unresolved_conflict: bool = False,
+    any_conflict: bool = False,
+    timeline_complete: bool = True,
+    shipment_insufficient: bool = False,
+    policy_ambiguous: bool = False,
+    partial_evidence: bool = False,
+    partial_claim: bool = False,
 ) -> float:
+    """Evidence-quality confidence. Every penalty must be able to fire.
+
+    Caps encode structural uncertainty: needs_investigation means the system
+    itself defers judgment, so confidence can never be high there. A model
+    signal only lowers the starting point; caps always apply.
+    """
     confidence = 0.95
+    if model_confidence is not None and 0.0 <= model_confidence <= 1.0:
+        confidence = min(confidence, model_confidence)
     if entity_status == "ambiguous":
-        confidence -= 0.25
+        confidence -= 0.30
     if entity_status == "not_found":
         confidence -= 0.25
     if missing_evidence:
-        confidence -= 0.20
+        confidence -= 0.25
     if unresolved_conflict:
         confidence -= 0.20
+    elif any_conflict:
+        confidence -= 0.10
     if not timeline_complete:
-        confidence -= 0.15
+        confidence -= 0.20
     if policy_ambiguous:
         confidence -= 0.15
     if partial_evidence:
         confidence -= 0.10
+    if partial_claim:
+        confidence -= 0.10
     confidence = max(0.0, min(1.0, confidence))
     if entity_status == "ambiguous":
-        confidence = min(confidence, 0.65)
+        confidence = min(confidence, 0.60)
     if primary_issue == "insufficient_evidence":
+        confidence = min(confidence, 0.45)
+    if case_status == "needs_investigation":
+        confidence = min(confidence, 0.55)
+    if shipment_insufficient:
         confidence = min(confidence, 0.50)
     if unresolved_conflict:
-        confidence = min(confidence, 0.60)
+        confidence = min(confidence, 0.55)
+    elif any_conflict:
+        confidence = min(confidence, 0.80)
+    if primary_issue == "unsupported_claim":
+        confidence = min(confidence, 0.85)
     return round(confidence, 3)
 
 
@@ -348,16 +386,73 @@ def _order_status(state: CaseState, resolved: list[str]) -> str:
     return ""
 
 
+async def _model_review(
+    *,
+    router: Any,
+    assessments: list[dict[str, Any]],
+    primary: str,
+    secondary: list[str],
+    shipment_verdict: str,
+    claims: list[dict[str, Any]],
+    rules: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Escalate genuine semantic ambiguity to the hybrid router.
+
+    Triggers (explicit signals only): deterministic primary is
+    insufficient_evidence while some claim is partial/undecided; shipment
+    sources conflict; or several distinct issues are simultaneously supported.
+    Clean supported/unsupported outcomes never consult a model.
+    """
+    verdicts = {a.get("verdict") for a in assessments}
+    topics = [str(c.get("topic", "")) for c in claims]
+    supported_topics = {
+        topics[i] for i, a in enumerate(assessments)
+        if a.get("verdict") in ("supported", "partially_supported") and i < len(topics)
+    } - {"requested_full_refund"}
+    multi = len(supported_topics) >= 2
+    needs_model = (
+        (
+            primary == "insufficient_evidence"
+            and bool(verdicts & {"partially_supported", "insufficient_evidence"})
+            and bool(topics)
+        )
+        or shipment_verdict == "conflicting"
+        or multi
+    )
+    if not needs_model:
+        return None
+    complexity = "complex" if (shipment_verdict == "conflicting" or multi) else "simple"
+    context = {
+        "deterministic_primary": primary,
+        "deterministic_secondary": list(secondary),
+        "shipment_verdict": shipment_verdict,
+        "claims": [{"claim_id": str(c.get("claim_id")), "topic": str(c.get("topic"))}
+                   for c in claims],
+        "assessments": [
+            {"claim_id": a.get("claim_id"), "verdict": a.get("verdict")} for a in assessments
+        ],
+        "policy_rules": rules,
+    }
+    claim_ids = [str(c.get("claim_id", "")) for c in claims]
+    decision = await router.decide_policy(context, claim_ids, complexity)
+    if decision is None or decision.get("model_confidence", 0.0) < POLICY_MODEL_MIN_CONFIDENCE:
+        return None
+    return decision
+
+
 async def run_policy_conflict_agent(
     case: dict[str, Any],
     state: CaseState,
     gateway: Any,
     trace: Any,
     bundle: dict[str, Any],
+    router: Any | None = None,
 ) -> dict[str, Any]:
     """Interpret policy, assess claims, resolve conflicts, decide money.
 
     Never refetches order/shipment/payment evidence; reads specialist facts.
+    An optional hybrid `router` settles genuine semantic ambiguity; money,
+    IDs, refs, and policy rule lookup stay deterministic.
     """
     case_id = str(case.get("case_id", state.case_id))
     claims = _claims(case)
@@ -451,6 +546,33 @@ async def run_policy_conflict_agent(
         claim_assessments=assessments,
         claims=claims[:5],
     )
+    model_confidence: float | None = None
+    adopted_action_code: str | None = None
+    adopted_party_types: list[str] = []
+    verdict_overrides: dict[str, str] = {}
+    if router is not None:
+        decision = await _model_review(
+            router=router,
+            assessments=assessments,
+            primary=primary,
+            secondary=secondary,
+            shipment_verdict=shipment_verdict,
+            claims=claims[:5],
+            rules=rules,
+        )
+        if decision is not None:
+            primary = decision["primary_issue"]
+            secondary = list(decision["secondary_issues"])
+            model_confidence = decision["model_confidence"]
+            for claim_id, verdict in decision["claim_verdicts"].items():
+                verdict_overrides[claim_id] = verdict
+            adopted_party_types = list(decision["responsible_party_types"])
+            codes = [c for c in decision["resolution_action_codes"] if c in _ACTION_MAP]
+            if codes:
+                adopted_action_code = codes[0]
+            for conflict_note in decision["semantic_conflicts"]:
+                warnings.append(f"model semantic conflict: {conflict_note}")
+            warnings.append("model-assisted policy decision adopted.")
     rule = rules.get(primary)
     entitlement = _rule_refund(rule)
     if rule is None:
@@ -482,6 +604,14 @@ async def run_policy_conflict_agent(
         for claim in claims[:5]
     ]
 
+    for assessment in assessments:
+        override = verdict_overrides.get(assessment.get("claim_id", ""))
+        if override is not None and override != assessment["verdict"]:
+            assessment["verdict"] = override
+            assessment["confidence"] = round(
+                min(float(assessment.get("confidence", 0.0)), model_confidence or 0.0), 3
+            )
+
     for assessment, claim in zip(assessments, claims[:5], strict=True):
         topic = str(claim.get("topic", ""))
         claim_id = str(claim.get("claim_id", ""))
@@ -509,11 +639,17 @@ async def run_policy_conflict_agent(
             })
 
     parties = _responsible_parties(rule, evidenced_sellers)
+    if adopted_party_types and len(adopted_party_types) == len(parties):
+        parties = [
+            {**party, "party_type": party_type}
+            for party, party_type in zip(parties, adopted_party_types, strict=True)
+        ]
     ranked = [{"cause_code": primary.upper(), "rank": 1}]
     if secondary:
         ranked.append({"cause_code": secondary[0].upper(), "rank": 2})
 
-    reason_code = str((rule or {}).get("recommended_action") or primary)
+    recommended_code = adopted_action_code or (rule or {}).get("recommended_action")
+    reason_code = str(recommended_code or primary)
     refund_lines: list[dict[str, Any]] = []
     if recommended > 0 and resolved:
         refund_lines.append({
@@ -522,7 +658,7 @@ async def run_policy_conflict_agent(
             "entity_id": resolved[0],
         })
     actions = build_resolution_actions(
-        recommended_action=(rule or {}).get("recommended_action"),
+        recommended_action=recommended_code,
         recommended_refund=recommended,
         case_status=case_status,
         shipment_verdict=shipment_verdict,
@@ -542,11 +678,16 @@ async def run_policy_conflict_agent(
     confidence = calibrate_confidence(
         entity_status=entity.get("status"),
         primary_issue=primary,
+        case_status=case_status,
+        model_confidence=model_confidence,
         missing_evidence=specialist_failed or policy_data is None,
         unresolved_conflict=still_unresolved,
+        any_conflict=bool(state.conflicts) or bool(new_conflicts),
         timeline_complete=bool(shipment_facts.get("timeline_complete", False)),
+        shipment_insufficient=shipment_verdict == "insufficient_evidence",
         policy_ambiguous=policy_ambiguous,
         partial_evidence=specialist_failed,
+        partial_claim=any(a["verdict"] == "partially_supported" for a in assessments),
     )
     state.conflicts.extend(new_conflicts)
     state.warnings.extend(warnings)

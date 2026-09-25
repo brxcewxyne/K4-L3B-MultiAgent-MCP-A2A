@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from ..evidence import CaseState, consume_evidence
+from ..reasoning import LABEL_MODEL_MIN_CONFIDENCE, SHIPMENT_VERDICTS
 
 AGENT_NAME = "shipment-agent"
 
@@ -250,11 +251,50 @@ def decide_shipment_verdict(
             "reason": "seller handoff on time but downstream delivery late",
         }
     return {
-        "verdict": "logistics_delay",
+        "verdict": "insufficient_evidence",
         "late_seller_ids": [],
-        "timeline_complete": True,
-        "reason": "delivery late; no seller handoff evidence, attributed downstream",
+        "timeline_complete": False,
+        "reason": "delivery late but seller attribution evidence missing",
     }
+
+
+def _status_text(data: Any) -> str:
+    texts: list[str] = []
+    for row in _event_rows(data):
+        for key in ("status", "event_type", "event", "actor"):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+    if isinstance(data, dict):
+        for key in _STATUS_KEYS:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+    return "; ".join(texts)
+
+
+async def _model_review(
+    data: Any, verdict: dict[str, Any], router: Any, warnings: list[str]
+) -> dict[str, Any]:
+    """Model review for unclear/conflicting labels only. Timestamp-derived
+    verdicts never reach this path; adoption needs a valid enum + confidence."""
+    if verdict["verdict"] == "conflicting":
+        resolved = await router.resolve_conflict("shipment", {"status_text": _status_text(data)})
+    else:
+        resolved = await router.interpret_label(
+            "shipment", _status_text(data), SHIPMENT_VERDICTS
+        )
+    if (
+        resolved is None
+        or resolved.get("label") not in SHIPMENT_VERDICTS
+        or float(resolved.get("model_confidence", 0.0)) < LABEL_MODEL_MIN_CONFIDENCE
+    ):
+        return verdict
+    adopted = dict(verdict)
+    adopted["verdict"] = resolved["label"]
+    adopted["reason"] = "model-interpreted label; timestamps indecisive"
+    warnings.append(f"shipment label interpreted by model: {resolved['label']}.")
+    return adopted
 
 
 async def run_shipment_agent(
@@ -263,8 +303,14 @@ async def run_shipment_agent(
     gateway: Any,
     trace: Any,
     resolved_order_ids: list[str] | None = None,
+    router: Any | None = None,
 ) -> dict[str, Any]:
-    """Fetch shipment summaries and derive verdicts deterministically."""
+    """Fetch shipment summaries and derive verdicts deterministically.
+
+    An optional hybrid `router` interprets unclear textual labels only when
+    deterministic rules yield insufficient/conflicting evidence. Explicit
+    timestamps are never overridden by a model.
+    """
     case_id = str(case.get("case_id", state.case_id))
     if resolved_order_ids is None:
         resolved_order_ids = list(state.entity.get("resolved_order_ids") or [])
@@ -307,7 +353,10 @@ async def run_shipment_agent(
             evidence_refs.append(ref)
         data = evidence.get("data")
         state.facts["shipment"][order_id] = data
-        verdicts[order_id] = decide_shipment_verdict(data, _seller_ids_in_facts(state, order_id))
+        verdict = decide_shipment_verdict(data, _seller_ids_in_facts(state, order_id))
+        if router is not None and verdict["verdict"] in ("insufficient_evidence", "conflicting"):
+            verdict = await _model_review(data, verdict, router, warnings)
+        verdicts[order_id] = verdict
 
     priority = {
         "lost": 0, "returned": 1, "conflicting": 2, "seller_delay": 3,
