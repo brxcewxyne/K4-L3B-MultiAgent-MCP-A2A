@@ -77,6 +77,74 @@ def _parties(issue: str, sellers: list[str]) -> list[dict[str, Any]]:
     return [{"party_type": party, "party_id": None}]
 
 
+def _claim_result(
+    topic: Any,
+    issue: str,
+    entity: EntityResult,
+    payment: PaymentResult,
+    shipment: ShipmentResult,
+    amount: Decimal,
+    remaining: Decimal | None,
+) -> tuple[str, list[dict[str, Any] | None]]:
+    """Assess a claim against its own evidence, independent of the primary issue."""
+    status = entity.order.get("order_status")
+    payment_verdict = payment.analysis["verdict"]
+    shipment_verdict = shipment.analysis["verdict"]
+    captured = payment.analysis["captured_total_brl"]
+
+    support: bool | None
+    if topic == "requested_full_refund":
+        support = None if remaining is None else amount > 0 and amount >= remaining
+        evidence = [payment.timeline_evidence, payment.refund_evidence,
+                    entity.order_evidence]
+    elif topic == "canceled_order_paid":
+        support = None if captured is None else status == "canceled" and captured > 0
+        evidence = [entity.order_evidence, payment.timeline_evidence]
+    elif topic == "unavailable_order_paid":
+        support = None if captured is None else status == "unavailable" and captured > 0
+        evidence = [entity.order_evidence, payment.timeline_evidence]
+    elif topic == "late_delivery_seller":
+        support = (
+            None if shipment_verdict == "insufficient_evidence"
+            else shipment_verdict == "seller_delay"
+        )
+        evidence = [shipment.evidence, entity.order_evidence]
+    elif topic == "late_delivery_logistics":
+        support = (
+            None if shipment_verdict == "insufficient_evidence"
+            else shipment_verdict == "logistics_delay"
+        )
+        evidence = [shipment.evidence, entity.order_evidence]
+    elif topic in {"payment_mismatch", "duplicate_charge", "valid_split_payment"}:
+        if payment_verdict == "insufficient_evidence":
+            support = None
+        else:
+            support = {
+                "payment_mismatch": payment_verdict == "capture_mismatch",
+                "duplicate_charge": payment_verdict == "duplicate_capture",
+                "valid_split_payment": payment.is_split,
+            }[topic]
+        evidence = [payment.timeline_evidence, entity.order_evidence]
+    elif topic in {"refund_pending", "refund_failed"}:
+        if payment_verdict == "insufficient_evidence":
+            support = None
+        else:
+            support = payment_verdict == topic
+        evidence = [payment.refund_evidence, payment.timeline_evidence]
+    elif topic == "unsupported_claim":
+        support = issue == "unsupported_claim"
+        evidence = [entity.order_evidence, shipment.evidence,
+                    payment.timeline_evidence, payment.refund_evidence]
+    else:
+        support = False
+        evidence = []
+
+    verdict = "insufficient_evidence" if support is None else (
+        "supported" if support else "unsupported"
+    )
+    return verdict, evidence
+
+
 async def decide_policy(
     case: dict[str, Any], entity: EntityResult, order: OrderResult,
     payment: PaymentResult, shipment: ShipmentResult,
@@ -93,31 +161,23 @@ async def decide_policy(
         status = "needs_investigation"
     if not policy_evidence or issue == "insufficient_evidence":
         status = "needs_investigation"
-    remaining = money(payment.analysis["refundable_total_brl"]) or Decimal(0)
+    remaining = money(payment.analysis["refundable_total_brl"])
     amount = money(rule.get("refund_brl")) or Decimal(0)
     amount = (
-        min(amount, remaining)
+        min(amount, remaining or Decimal(0))
         if status == "action_required" and issue != "payment_mismatch"
         else Decimal(0)
     )
     action = rule.get("recommended_action")
     actions = ([action] if isinstance(action, str) and 0 < len(action) <= 80
                else ["investigate_missing_evidence"])
-    claim_refs = refs(
-        entity.order_evidence, order.items_evidence, shipment.evidence,
-        payment.timeline_evidence, payment.refund_evidence, policy_evidence,
-    )
     claims = []
     for claim in rows(obj(case.get("customer_request")).get("claims"))[:5]:
         topic = claim.get("topic")
-        supported = (
-            amount > 0 and amount == remaining
-            if topic == "requested_full_refund" else topic == issue
+        verdict, relevant_evidence = _claim_result(
+            topic, issue, entity, payment, shipment, amount, remaining
         )
-        verdict = (
-            "insufficient_evidence" if issue == "insufficient_evidence"
-            else ("supported" if supported else "unsupported")
-        )
+        claim_refs = refs(*relevant_evidence, policy_evidence)
         claims.append({
             "claim_id": str(claim.get("claim_id", "unknown"))[:64],
             "verdict": verdict,

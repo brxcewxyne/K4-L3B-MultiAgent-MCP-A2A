@@ -10,7 +10,7 @@ from .evidence import EvidenceCollector
 from .llm import MiniClient
 from .order_item import inspect_order
 from .payment import inspect_payment
-from .policy import decide_policy
+from .policy import ISSUES, decide_policy
 from .shipment import inspect_shipment
 from .verifier import verify_output
 
@@ -130,7 +130,18 @@ class Coordinator:
             "schema_version": "day09-l3b-output-v2",
             "case_id": case_id,
             "assessment": {
-                "primary_issue": policy.issue, "secondary_issues": [],
+                "primary_issue": policy.issue,
+                "secondary_issues": list(dict.fromkeys(
+                    claim.get("topic") for claim, assessment in zip(
+                        obj(case.get("customer_request")).get("claims", []),
+                        policy.claims,
+                    )
+                    if isinstance(claim, dict)
+                    and isinstance(claim.get("topic"), str)
+                    and claim.get("topic") in ISSUES
+                    and claim.get("topic") != policy.issue
+                    and assessment.get("verdict") == "supported"
+                ))[:10],
                 "case_status": policy.status, "confidence": policy.confidence,
             },
             "affected_entities": {

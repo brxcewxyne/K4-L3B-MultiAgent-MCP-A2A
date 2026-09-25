@@ -25,6 +25,14 @@ DOMAINS = {
 }
 
 
+def _is_transient_transport_error(error: BaseException) -> bool:
+    if isinstance(error, ExceptionGroup):
+        return bool(error.exceptions) and all(
+            _is_transient_transport_error(item) for item in error.exceptions
+        )
+    return isinstance(error, (MCPError, httpx2.TransportError, TimeoutError))
+
+
 class EvidenceCollector:
     def __init__(
         self, case_id: str, gateway: EvidenceGateway, trace: TraceWriter, tools: set[str]
@@ -46,7 +54,12 @@ class EvidenceCollector:
         try:
             try:
                 evidence = await self.gateway.call(tool, case_id=self.case_id, **arguments)
-            except MCPError:
+            except (MCPError, httpx2.TransportError, TimeoutError):
+                await asyncio.sleep(0.5)
+                evidence = await self.gateway.call(tool, case_id=self.case_id, **arguments)
+            except ExceptionGroup as exc:
+                if not _is_transient_transport_error(exc):
+                    raise
                 await asyncio.sleep(0.5)
                 evidence = await self.gateway.call(tool, case_id=self.case_id, **arguments)
             if evidence["domain"] != DOMAINS[tool] or evidence["evidence_ref"] in self.used:
@@ -60,6 +73,12 @@ class EvidenceCollector:
             self.cache[key] = evidence
             return evidence
         except (MCPError, httpx2.TransportError, RuntimeError, ValueError, TimeoutError) as exc:
+            self.failures.append(f"{tool}:{type(exc).__name__}")
+            self.cache[key] = None
+            return None
+        except ExceptionGroup as exc:
+            if not _is_transient_transport_error(exc):
+                raise
             self.failures.append(f"{tool}:{type(exc).__name__}")
             self.cache[key] = None
             return None
