@@ -10,6 +10,7 @@ from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
+from .model_client import OpenAIModelClient
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -27,7 +28,13 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+async def _run(
+    root: Path,
+    *,
+    selected_case_id: str | None = None,
+    limit: int | None = None,
+    resume: bool = False,
+) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -35,23 +42,37 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+    if not resume:
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    model = OpenAIModelClient()
+
+    case_ids = list(case_set.case_ids)
+    if selected_case_id is not None:
+        if selected_case_id not in case_set.cases:
+            raise ValueError(f"unknown case ID: {selected_case_id}")
+        case_ids = [selected_case_id]
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("--limit must be positive")
+        case_ids = case_ids[:limit]
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        for case_id in case_ids:
+            target = output_root / f"{case_id}.json"
+            if resume and target.exists():
+                continue
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
+            output = await solve_case(case, gateway, trace, model=model)
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
             temporary = target.with_suffix(".json.tmp")
             temporary.write_text(
                 json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -66,7 +87,10 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow")
+    run.add_argument("--case-id", help="run one case only")
+    run.add_argument("--limit", type=int, help="run the first N selected cases")
+    run.add_argument("--resume", action="store_true", help="skip existing outputs")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -86,7 +110,14 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(
+                _run(
+                    root,
+                    selected_case_id=args.case_id,
+                    limit=args.limit,
+                    resume=args.resume,
+                )
+            )
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

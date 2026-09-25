@@ -21,14 +21,24 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def list_tool_specs(self) -> list[dict[str, Any]]:
+        response = await self._session.list_tools()
+        return [tool.model_dump(by_alias=True) for tool in response.tools]
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
+
             message = " ".join(
-                block.text for block in result.content if getattr(block, "text", None)
+                block.text
+                for block in result.content
+                if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+
+            raise RuntimeError(
+                f"MCP tool {tool_name} failed: {message or 'unknown error'}"
+            )
         evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             evidence = getattr(result, "structured_content", None)
