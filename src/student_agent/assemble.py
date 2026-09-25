@@ -51,6 +51,12 @@ def build_output(
     payment_facts = payment.get("facts", {})
 
     affected = (order_product.get("facts", {}).get("affected_entities", {}) or {})
+    payment_ref_list = list(payment_facts.get("payment_references", []) or [])
+    for ref in affected.get("payment_references", []):
+        if ref not in payment_ref_list:
+            payment_ref_list.append(ref)
+    affected = dict(affected)
+    affected["payment_references"] = payment_ref_list[:20]
     evidence_refs = list(state.evidence_refs)[:30]
     claim_assessments = []
     for assessment in policy_facts.get("claim_assessments", [])[:5]:
@@ -97,7 +103,7 @@ def build_output(
             "verdict": payment_facts.get("verdict", "insufficient_evidence"),
             "captured_total_brl": payment_facts.get("captured_total_brl"),
             "refunded_total_brl": payment_facts.get("refunded_total_brl"),
-            "refundable_total_brl": policy_facts.get("recommended_refund_brl"),
+            "refundable_total_brl": policy_facts.get("refundable_total_brl"),
         },
         "root_cause_analysis": {
             "ranked_causes": list(policy_facts.get("ranked_causes", []))[:5],

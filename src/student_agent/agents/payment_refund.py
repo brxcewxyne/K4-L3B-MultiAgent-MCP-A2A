@@ -27,6 +27,13 @@ _LIFECYCLE_CLAIM_TOPICS = (
     "refund_pending", "refund_failed",
 )
 _ITEM_VALUE_KEYS = ("price", "freight_value", "freight", "item_price", "total_value")
+# Identifiers that semantically qualify as payment references. Amounts, types,
+# installment counts, and timestamps never qualify; rows without one of these
+# keys are left unrepresented rather than fabricated.
+_PAYMENT_REF_KEYS = (
+    "payment_reference", "payment_id", "payment_sequential",
+    "transaction_id", "transaction_reference", "paymentReference",
+)
 
 
 def _as_dict_rows(data: Any, *container_keys: str) -> list[dict[str, Any]]:
@@ -135,6 +142,20 @@ async def _classify_unknown_rows(
     return totals
 
 
+def _collect_payment_refs(rows: list[dict[str, Any]]) -> list[str]:
+    """Collect real payment identifiers in first-seen order, deduplicated."""
+    found: list[str] = []
+    for row in rows:
+        for key in _PAYMENT_REF_KEYS:
+            value = row.get(key)
+            if isinstance(value, bool):
+                continue
+            text = str(value).strip() if isinstance(value, (str, int)) else ""
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
 def _row_identity(row: dict[str, Any]) -> tuple[str, str, str]:
     """Distinguish genuine installments/splits from repeated captures."""
     sequential = row.get("payment_sequential", row.get("sequential", ""))
@@ -202,6 +223,7 @@ async def run_payment_refund_agent(
     completed_refund = False
     timeline_called: list[str] = []
     refund_called: list[str] = []
+    payment_refs: list[str] = []
 
     if not resolved_order_ids:
         warnings.append("no resolved order; skipping payment/refund fan-out")
@@ -216,6 +238,7 @@ async def run_payment_refund_agent(
                 "refundable_total_brl": None,
                 "timeline_called": [],
                 "refund_called": [],
+                "payment_references": [],
             },
             "evidence_refs": [],
             "confidence": 0.2,
@@ -241,6 +264,9 @@ async def run_payment_refund_agent(
         rows = _as_dict_rows(
             evidence.get("data"), "payments", "payment_rows", "rows", "order_payments"
         )
+        for found in _collect_payment_refs(rows):
+            if found not in payment_refs:
+                payment_refs.append(found)
         if not rows:
             warnings.append(f"no payment rows evidenced for {order_id}")
             continue
@@ -308,6 +334,9 @@ async def run_payment_refund_agent(
                 timeline_rows = _as_dict_rows(
                     timeline_evidence.get("data"), "events", "timeline", "payments", "rows"
                 )
+                for found in _collect_payment_refs(timeline_rows):
+                    if found not in payment_refs:
+                        payment_refs.append(found)
                 if timeline_rows and amounts:
                     timeline_amounts = [
                         a for row in timeline_rows if (a := _amount_of(row)) is not None
@@ -340,6 +369,9 @@ async def run_payment_refund_agent(
                 refund_rows = _as_dict_rows(
                     refund_evidence.get("data"), "events", "timeline", "refunds", "rows"
                 )
+                for found in _collect_payment_refs(refund_rows):
+                    if found not in payment_refs:
+                        payment_refs.append(found)
                 for row in refund_rows:
                     text = _row_text(row)
                     if any(mark in text for mark in _FAILED_MARKS):
@@ -394,6 +426,7 @@ async def run_payment_refund_agent(
             "refundable_total_brl": None,
             "timeline_called": list(timeline_called),
             "refund_called": list(refund_called),
+            "payment_references": list(payment_refs),
         },
         "evidence_refs": list(evidence_refs),
         "confidence": confidence,

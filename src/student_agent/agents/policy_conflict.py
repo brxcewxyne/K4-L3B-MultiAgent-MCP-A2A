@@ -250,6 +250,14 @@ def select_primary_issue(
                 primary = candidate
                 break
     secondary: list[str] = []
+    for issue in _evidence_issue_order(
+        shipment_verdict=shipment_verdict,
+        payment_verdict=payment_verdict,
+        order_status=order_status,
+        captured_total=captured_total,
+    ):
+        if issue != primary and issue not in secondary:
+            secondary.append(issue)
     for assessment in claim_assessments:
         candidate = topic_of.get(assessment["claim_id"], "")
         if (
@@ -261,6 +269,39 @@ def select_primary_issue(
         ):
             secondary.append(candidate)
     return primary, secondary[:10]
+
+
+def _evidence_issue_order(
+    *,
+    shipment_verdict: str,
+    payment_verdict: str,
+    order_status: str,
+    captured_total: float | None,
+) -> list[str]:
+    """Confirmed problem issues in primary-precedence order, evidence only.
+
+    No claim text involved: every entry requires an authoritative verdict or
+    terminal order state. valid_split_payment is excluded here (a clean split
+    is not a problem); it can still arrive via a supported claim.
+    """
+    issues: list[str] = []
+    if payment_verdict == "duplicate_capture":
+        issues.append("duplicate_charge")
+    if payment_verdict == "capture_mismatch":
+        issues.append("payment_mismatch")
+    if payment_verdict == "refund_failed":
+        issues.append("refund_failed")
+    if order_status == "canceled" and (captured_total or 0) > 0:
+        issues.append("canceled_order_paid")
+    if order_status == "unavailable" and (captured_total or 0) > 0:
+        issues.append("unavailable_order_paid")
+    if shipment_verdict == "seller_delay":
+        issues.append("late_delivery_seller")
+    if shipment_verdict in ("logistics_delay", "lost", "returned"):
+        issues.append("late_delivery_logistics")
+    if payment_verdict == "refund_pending":
+        issues.append("refund_pending")
+    return issues
 
 
 def calibrate_confidence(
@@ -386,6 +427,39 @@ def _order_status(state: CaseState, resolved: list[str]) -> str:
     return ""
 
 
+def _compatible_with_facts(
+    primary: str,
+    *,
+    shipment_verdict: str,
+    payment_verdict: str,
+    order_status: str,
+    captured_total: float | None,
+) -> bool:
+    """A model-adopted primary must agree with hard deterministic facts.
+
+    The model may choose AMONG evidenced issues, never against them.
+    """
+    if primary == "late_delivery_seller":
+        return shipment_verdict == "seller_delay"
+    if primary == "late_delivery_logistics":
+        return shipment_verdict in ("logistics_delay", "lost", "returned")
+    if primary == "duplicate_charge":
+        return payment_verdict == "duplicate_capture"
+    if primary == "payment_mismatch":
+        return payment_verdict == "capture_mismatch"
+    if primary == "refund_failed":
+        return payment_verdict == "refund_failed"
+    if primary == "refund_pending":
+        return payment_verdict == "refund_pending"
+    if primary == "canceled_order_paid":
+        return order_status == "canceled" and (captured_total or 0) > 0
+    if primary == "unavailable_order_paid":
+        return order_status == "unavailable" and (captured_total or 0) > 0
+    if primary == "valid_split_payment":
+        return payment_verdict == "reconciled"
+    return primary in ("unsupported_claim", "insufficient_evidence")
+
+
 async def _model_review(
     *,
     router: Any,
@@ -393,6 +467,10 @@ async def _model_review(
     primary: str,
     secondary: list[str],
     shipment_verdict: str,
+    payment_verdict: str,
+    order_status: str,
+    captured_total: float | None,
+    remaining: float | None,
     claims: list[dict[str, Any]],
     rules: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -400,8 +478,11 @@ async def _model_review(
 
     Triggers (explicit signals only): deterministic primary is
     insufficient_evidence while some claim is partial/undecided; shipment
-    sources conflict; or several distinct issues are simultaneously supported.
-    Clean supported/unsupported outcomes never consult a model.
+    sources conflict; several distinct issues are simultaneously supported;
+    any claim is partially supported; the granted entitlement differs
+    materially from the requested remedy; or the primary denies everything
+    while some claim remains undecided. Clean supported/unsupported outcomes
+    never consult a model.
     """
     verdicts = {a.get("verdict") for a in assessments}
     topics = [str(c.get("topic", "")) for c in claims]
@@ -410,6 +491,18 @@ async def _model_review(
         if a.get("verdict") in ("supported", "partially_supported") and i < len(topics)
     } - {"requested_full_refund"}
     multi = len(supported_topics) >= 2
+    partials = [a for a in assessments if a.get("verdict") == "partially_supported"]
+    entitlement = _rule_refund(rules.get(primary))
+    ask_present = "requested_full_refund" in topics
+    material_gap = (
+        ask_present
+        and remaining is not None
+        and entitlement > 0
+        and entitlement < remaining - 0.01
+    )
+    undecided_denial = (
+        primary == "unsupported_claim" and "insufficient_evidence" in verdicts
+    )
     needs_model = (
         (
             primary == "insufficient_evidence"
@@ -418,10 +511,15 @@ async def _model_review(
         )
         or shipment_verdict == "conflicting"
         or multi
+        or bool(partials)
+        or material_gap
+        or undecided_denial
     )
     if not needs_model:
         return None
-    complexity = "complex" if (shipment_verdict == "conflicting" or multi) else "simple"
+    complexity = "complex" if (
+        shipment_verdict == "conflicting" or multi or len(partials) >= 2
+    ) else "simple"
     context = {
         "deterministic_primary": primary,
         "deterministic_secondary": list(secondary),
@@ -434,8 +532,18 @@ async def _model_review(
         "policy_rules": rules,
     }
     claim_ids = [str(c.get("claim_id", "")) for c in claims]
-    decision = await router.decide_policy(context, claim_ids, complexity)
-    if decision is None or decision.get("model_confidence", 0.0) < POLICY_MODEL_MIN_CONFIDENCE:
+    decision = await router.decide_policy(
+        context, claim_ids, complexity, min_confidence=POLICY_MODEL_MIN_CONFIDENCE
+    )
+    if decision is None:
+        return None
+    if not _compatible_with_facts(
+        decision["primary_issue"],
+        shipment_verdict=shipment_verdict,
+        payment_verdict=payment_verdict,
+        order_status=order_status,
+        captured_total=captured_total,
+    ):
         return None
     return decision
 
@@ -557,6 +665,10 @@ async def run_policy_conflict_agent(
             primary=primary,
             secondary=secondary,
             shipment_verdict=shipment_verdict,
+            payment_verdict=payment_verdict,
+            order_status=order_status,
+            captured_total=captured_total,
+            remaining=remaining,
             claims=claims[:5],
             rules=rules,
         )
@@ -579,9 +691,13 @@ async def run_policy_conflict_agent(
         warnings.append(f"no policy rule for {primary}; entitlement treated as 0")
         policy_ambiguous = True
     if remaining is None:
+        refundable = None
         recommended = 0.0
         warnings.append("transaction totals unknown; recommended refund forced to 0")
     else:
+        # Distinct concepts: refundable = still available from captured funds;
+        # recommended = what policy actually grants (never above refundable).
+        refundable = round(remaining, 2)
         recommended = round(min(entitlement, remaining), 2)
     rule_status = (rule or {}).get("case_status")
     if rule_status in ("action_required", "no_action", "needs_investigation"):
@@ -714,6 +830,7 @@ async def run_policy_conflict_agent(
             "refund_lines": refund_lines,
             "resolution_actions": list(actions),
             "remaining_brl": remaining,
+            "refundable_total_brl": refundable,
             "entitlement_brl": entitlement,
             "policy_version": policy_version if isinstance(policy_version, str) else None,
         },

@@ -393,6 +393,35 @@ def test_payment_timeline_called_for_mismatch_claim(tmp_path: Path) -> None:
     assert gateway.tools_called("get_payment_timeline") == 1
 
 
+def test_payment_references_collected_deduped_ordered(tmp_path: Path) -> None:
+    gateway = FakeGateway({
+        ("get_order_payments", "O1"): ("payment", {"payments": [
+            {"status": "paid", "payment_value": "40.00", "payment_sequential": "1"},
+            {"status": "paid", "payment_value": "40.00", "payment_sequential": "2"},
+            {"status": "paid", "payment_value": "40.00", "payment_sequential": "1"},
+            {"status": "paid", "payment_value": "10.00"},
+        ]}),
+    })
+    state = new_case_state(_case())
+    result = asyncio.run(
+        run_payment_refund_agent(_case(), state, gateway, _trace(tmp_path), ["O1"])
+    )
+    assert result["facts"]["payment_references"] == ["1", "2"]
+
+
+def test_payment_references_omit_rows_without_ids(tmp_path: Path) -> None:
+    gateway = FakeGateway({
+        ("get_order_payments", "O1"): ("payment", {"payments": [
+            {"status": "paid", "payment_value": "40.00"},
+        ]}),
+    })
+    state = new_case_state(_case())
+    result = asyncio.run(
+        run_payment_refund_agent(_case(), state, gateway, _trace(tmp_path), ["O1"])
+    )
+    assert result["facts"]["payment_references"] == []
+
+
 # --- Isolation / harness / trace ---
 
 

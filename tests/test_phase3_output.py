@@ -5,12 +5,29 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import student_agent.workflow as workflow
 from student_agent.agents.policy_conflict import calibrate_confidence
 from student_agent.agents.verifier import run_verifier
 from student_agent.contracts import Contracts
 from student_agent.evidence import new_case_state
+from student_agent.reasoning import ModelSettings, ReasoningRouter
 from student_agent.trace import TraceWriter
 from student_agent.workflow import solve_case
+
+
+@pytest.fixture(autouse=True)
+def _no_live_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """solve_case builds a hybrid router; neutralize providers so unit tests
+    never touch real Ollama/OpenAI. Router-gated behavior is covered with
+    explicit fakes in test_hybrid_reasoning.py."""
+    monkeypatch.setattr(
+        workflow, "build_router",
+        lambda root=None: ReasoningRouter(
+            settings=ModelSettings(openai_api_key=""), qwen_enabled=False
+        ),
+    )
 
 
 def _root() -> Path:
@@ -323,3 +340,113 @@ def test_call_stats_track_cache_hits(tmp_path: Path) -> None:
     asyncio.run(fetch_evidence(state, gateway, "get_order", case_id="CASE_001", order_id="O1"))
     assert state.call_stats["mcp_calls"] == 1
     assert state.call_stats["cache_hits"] == 1
+
+
+def test_refundable_is_remaining_not_recommended(tmp_path: Path) -> None:
+    output = _solve(_happy_case(), _happy_gateway(), tmp_path)
+    payment = output["payment_analysis"]
+    financial = output["financial_resolution"]
+    assert payment["captured_total_brl"] == 110.0
+    assert payment["refunded_total_brl"] == 0.0
+    assert payment["refundable_total_brl"] == 110.0
+    assert financial["recommended_refund_brl"] == 16.0
+    assert 0 <= financial["recommended_refund_brl"] <= payment["refundable_total_brl"]
+    assert payment["refundable_total_brl"] <= (
+        payment["captured_total_brl"] - payment["refunded_total_brl"] + 0.01
+    )
+
+
+def test_zero_remaining_funds(tmp_path: Path) -> None:
+    gateway = _happy_gateway()
+    domain, data = gateway.responses[("get_order_payments", "O1")]
+    data["payments"].append({"status": "refunded", "payment_value": "110.00"})
+    gateway.responses[("get_order_payments", "O1")] = (domain, data)
+    output = _solve(_happy_case(), gateway, tmp_path)
+    assert output["payment_analysis"]["refundable_total_brl"] == 0.0
+    assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
+
+
+def test_secondary_backfilled_from_evidence(tmp_path: Path) -> None:
+    rows = [
+        {"status": "paid", "payment_value": 60.0, "payment_sequential": "1"},
+        {"status": "paid", "payment_value": 60.0, "payment_sequential": "2"},
+    ]
+    gateway = _happy_gateway()
+    gateway.responses[("get_order_payments", "O1")] = ("payment", {"payments": rows})
+    gateway.responses[("get_payment_timeline", "O1")] = ("payment", {"events": rows})
+    output = _solve(_happy_case(), gateway, tmp_path)
+    assert output["assessment"]["primary_issue"] == "duplicate_charge"
+    assert "late_delivery_logistics" in output["assessment"]["secondary_issues"]
+    assert "duplicate_charge" not in output["assessment"]["secondary_issues"]
+    assert len(output["assessment"]["secondary_issues"]) == len(
+        set(output["assessment"]["secondary_issues"])
+    )
+
+
+def test_unsupported_claim_never_promoted_to_secondary(tmp_path: Path) -> None:
+    gateway = _happy_gateway()
+    data = dict(gateway.responses[("get_shipment_summary", "O1")][1])
+    data.update({
+        "delivered_customer_at": "2018-02-01T10:00:00-03:00",
+        "estimated_delivery_at": "2018-02-05T10:00:00-03:00",
+    })
+    gateway.responses[("get_shipment_summary", "O1")] = ("shipment", data)
+    output = _solve(_happy_case(), gateway, tmp_path)
+    assert "late_delivery_logistics" not in output["assessment"]["secondary_issues"]
+
+
+def test_verifier_caps_recommended_above_refundable(tmp_path: Path) -> None:
+    case, gateway = _happy_case(), _happy_gateway()
+    output = _solve(case, gateway, tmp_path)
+    output["financial_resolution"]["recommended_refund_brl"] = 200.0
+    fixed, notes = run_verifier(output, _verified_state(tmp_path, case, output), case,
+                                _trace(tmp_path))
+    assert notes
+    assert fixed["financial_resolution"]["recommended_refund_brl"] <= (
+        fixed["payment_analysis"]["refundable_total_brl"] + 0.01
+    )
+
+
+def test_verifier_flags_refundable_above_remaining(tmp_path: Path) -> None:
+    case, gateway = _happy_case(), _happy_gateway()
+    output = _solve(case, gateway, tmp_path)
+    output["payment_analysis"]["refundable_total_brl"] = 9999.0
+    _, notes = run_verifier(output, _verified_state(tmp_path, case, output), case,
+                            _trace(tmp_path))
+    assert notes, "expected downgrade: refundable exceeded remaining funds"
+
+
+def test_assembler_merges_payment_references() -> None:
+    from student_agent.assemble import build_output
+    from student_agent.evidence import new_case_state
+
+    case = {"case_id": "CASE_001"}
+    state = new_case_state(case)
+    for ref in ("ev_A", "ev_B"):
+        state.evidence_refs.append(ref)
+    bundle = {
+        "phase1": {"entity": {"status": "resolved", "resolved_order_ids": ["O1"],
+                              "rejected_candidates": [], "confidence": 0.8,
+                              "customer_unique_id": "C1"},
+                   "evidence_refs": ["ev_A"], "facts": {"history_order_ids": ["O1"]}},
+        "order_product": {"facts": {"affected_entities": {
+            "order_ids": ["O1"], "item_ids": [], "seller_ids": [],
+            "payment_references": ["1"], "shipment_ids": []}}},
+        "shipment": {"facts": {"verdict": "on_time", "late_seller_ids": [],
+                               "timeline_complete": True}},
+        "payment": {"facts": {"verdict": "reconciled", "captured_total_brl": 10.0,
+                              "refunded_total_brl": 0.0, "refundable_total_brl": 10.0,
+                              "payment_references": ["2", "1"]}},
+    }
+    policy = {"confidence": 0.9, "facts": {
+        "primary_issue": "unsupported_claim", "secondary_issues": [],
+        "case_status": "no_action", "claim_assessments": [],
+        "responsible_parties": [{"party_type": "customer", "party_id": None}],
+        "ranked_causes": [{"cause_code": "UNSUPPORTED_CLAIM", "rank": 1}],
+        "recommended_refund_brl": 0.0, "refund_lines": [],
+        "refundable_total_brl": 10.0,
+        "resolution_actions": ["no_action_required_documented"]}}
+    output = build_output(case, state, bundle, policy)
+    assert output["affected_entities"]["payment_references"] == ["2", "1"]
+    assert output["payment_analysis"]["refundable_total_brl"] == 10.0
+    assert output["financial_resolution"]["recommended_refund_brl"] == 0.0

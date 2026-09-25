@@ -429,10 +429,12 @@ class ReasoningRouter:
             return None
 
     async def decide_policy(
-        self, context: dict[str, Any], claim_ids: list[str], complexity: str = "simple"
+        self, context: dict[str, Any], claim_ids: list[str], complexity: str = "simple",
+        min_confidence: float = 0.0,
     ) -> dict[str, Any] | None:
         """Policy decision with strict schema. Qwen first; GPT when the case is
-        complex or Qwen fails. Returns validated decision or None."""
+        complex, Qwen fails, or Qwen is valid but below min_confidence.
+        Returns validated decision or None."""
         user = json.dumps(context, ensure_ascii=False, default=str)
         system = (
             "Decide the dispute outcome from normalized case facts, claims, and "
@@ -443,7 +445,7 @@ class ReasoningRouter:
         _ = complexity
         try:
             decided = validate_policy_decision(await self._ask_qwen(system, user), claim_ids)
-            if decided is not None:
+            if decided is not None and decided["model_confidence"] >= min_confidence:
                 return decided
         except ModelError:
             pass

@@ -67,6 +67,32 @@ def run_verifier(
     recommended = financial.get("recommended_refund_brl", 0)
     payment = fixed.get("payment_analysis", {})
     captured = payment.get("captured_total_brl")
+    refunded = payment.get("refunded_total_brl")
+    refundable = payment.get("refundable_total_brl")
+    for name, value in (
+        ("recommended_refund_brl", recommended),
+        ("refundable_total_brl", refundable),
+    ):
+        if value is not None and (not isinstance(value, (int, float)) or value < 0):
+            downgrade(f"invalid {name}; case needs review")
+    remaining = None
+    if isinstance(captured, (int, float)) and isinstance(refunded, (int, float)):
+        remaining = max(0.0, captured - refunded)
+    if (
+        isinstance(refundable, (int, float))
+        and remaining is not None
+        and refundable > remaining + 0.01
+    ):
+        downgrade("refundable exceeded remaining captured funds")
+    if (
+        isinstance(recommended, (int, float))
+        and isinstance(refundable, (int, float))
+        and recommended > refundable + 0.01
+    ):
+        financial["recommended_refund_brl"] = round(max(0.0, refundable), 2)
+        financial["refund_lines"] = []
+        fixed["financial_resolution"] = financial
+        downgrade("recommended refund exceeded refundable amount; capped")
     if not isinstance(recommended, (int, float)) or recommended < 0:
         financial["recommended_refund_brl"] = 0.0
         financial["refund_lines"] = []
