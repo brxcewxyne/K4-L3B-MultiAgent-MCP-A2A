@@ -538,3 +538,48 @@ def test_policy_gpt_invalid_falls_back(tmp_path: Path) -> None:
         _trace(tmp_path), _policy_bundle(), router))
     assert result["facts"]["primary_issue"] == "late_delivery_logistics"
     assert result["facts"]["recommended_refund_brl"] == 16.0
+
+
+def _policy_decision_with_conf(confidence: float) -> dict[str, Any]:
+    decision = _valid_policy_decision()
+    decision["model_confidence"] = confidence
+    return decision
+
+
+def test_policy_qwen_076_accepted_without_gpt(tmp_path: Path) -> None:
+    qwen = FakeQwen([_policy_decision_with_conf(0.76)])
+    gpt = FakeGpt()
+    gateway = PolicyGateway(_POLICY_RULES)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), gateway,
+        _trace(tmp_path), _policy_bundle(), _router(qwen, gpt)))
+    assert gpt.calls == []
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert "model-assisted policy decision adopted." in result["warnings"]
+    assert [call[0] for call in gateway.calls] == ["get_policy"]
+
+
+def test_policy_qwen_072_escalates_to_gpt(tmp_path: Path) -> None:
+    qwen = FakeQwen([_policy_decision_with_conf(0.72)])
+    gpt = FakeGpt([_valid_policy_decision()])
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
+                             qwen_client=qwen, gpt_client=gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert len(gpt.calls) == 1
+    assert router.usage["qwen_to_gpt_escalations"] == 1
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+
+
+def test_policy_gpt_failure_after_072_qwen_falls_back(tmp_path: Path) -> None:
+    qwen = FakeQwen([_policy_decision_with_conf(0.72)])
+    gpt = FakeGpt([ModelError("down")])
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
+                             qwen_client=qwen, gpt_client=gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["facts"]["recommended_refund_brl"] == 16.0
+    assert "model-assisted policy decision adopted." not in result["warnings"]
