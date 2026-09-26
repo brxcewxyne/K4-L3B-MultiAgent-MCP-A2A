@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..evidence import CaseState, consume_evidence
+from ..evidence import CaseState, consume_evidence, is_retryable_transport
 
 AGENT_NAME = "order-product-agent"
 
@@ -118,6 +118,8 @@ async def run_order_product_agent(
                 case_id=case_id, order_id=order_id,
             )
         except Exception as exc:  # noqa: BLE001 - partial failure, keep others
+            if is_retryable_transport(exc):
+                raise
             failed.append(f"get_order_items:{order_id}")
             warnings.append(f"get_order_items failed for {order_id}: {type(exc).__name__}")
             continue
@@ -148,6 +150,8 @@ async def run_order_product_agent(
                     case_id=case_id, order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001 - seller records are auxiliary
+                if is_retryable_transport(exc):
+                    raise
                 failed.append(f"get_sellers:{order_id}")
                 warnings.append(f"get_sellers failed for {order_id}: {type(exc).__name__}")
             else:
@@ -170,6 +174,8 @@ async def run_order_product_agent(
                     case_id=case_id, order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001 - product context is auxiliary
+                if is_retryable_transport(exc):
+                    raise
                 failed.append(f"get_product_context:{order_id}")
                 warnings.append(f"get_product_context failed for {order_id}: {type(exc).__name__}")
             else:

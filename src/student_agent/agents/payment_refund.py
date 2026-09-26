@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..evidence import CaseState, consume_evidence
+from ..evidence import CaseState, consume_evidence, is_retryable_transport
 from ..reasoning import LABEL_MODEL_MIN_CONFIDENCE, PAYMENT_STATES
 
 AGENT_NAME = "payment-refund-agent"
@@ -254,6 +254,8 @@ async def run_payment_refund_agent(
                 case_id=case_id, order_id=order_id,
             )
         except Exception as exc:  # noqa: BLE001 - partial failure, keep others
+            if is_retryable_transport(exc):
+                raise
             failed.append(f"get_order_payments:{order_id}")
             warnings.append(f"get_order_payments failed for {order_id}: {type(exc).__name__}")
             continue
@@ -323,6 +325,8 @@ async def run_payment_refund_agent(
                     case_id=case_id, order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001 - lifecycle is best-effort
+                if is_retryable_transport(exc):
+                    raise
                 warnings.append(
                     f"get_payment_timeline failed for {order_id}: {type(exc).__name__}"
                 )
@@ -357,6 +361,8 @@ async def run_payment_refund_agent(
                     case_id=case_id, order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001 - refund detail is best-effort
+                if is_retryable_transport(exc):
+                    raise
                 warnings.append(
                     f"get_refund_timeline failed for {order_id}: {type(exc).__name__}"
                 )

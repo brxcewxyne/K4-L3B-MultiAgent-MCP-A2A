@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from ..evidence import CaseState, consume_evidence
+from ..evidence import CaseState, consume_evidence, is_retryable_transport
 from ..reasoning import LABEL_MODEL_MIN_CONFIDENCE, SHIPMENT_VERDICTS
 
 AGENT_NAME = "shipment-agent"
@@ -345,6 +345,8 @@ async def run_shipment_agent(
                 case_id=case_id, order_id=order_id,
             )
         except Exception as exc:  # noqa: BLE001 - partial failure, keep others
+            if is_retryable_transport(exc):
+                raise
             failed.append(order_id)
             warnings.append(f"get_shipment_summary failed for {order_id}: {type(exc).__name__}")
             continue

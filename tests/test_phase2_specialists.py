@@ -495,7 +495,9 @@ def test_phase2_harness_links_every_ref_in_trace(tmp_path: Path) -> None:
         assert agent in assigned
 
 
-def test_phase2_harness_stops_without_resolved_order(tmp_path: Path) -> None:
+def test_phase2_harness_runs_specialists_without_resolved_order(tmp_path: Path) -> None:
+    """Agent-first: unresolved entity never stops the pipeline. Specialists
+    run with partial context and return structured insufficient evidence."""
     gateway = FakeGateway({
         ("get_order", "O1"): ("order", {"customer_unique_id": "C9"}),
         ("get_customer_history", "C1"): ("customer", {"order_ids": []}),
@@ -504,10 +506,12 @@ def test_phase2_harness_stops_without_resolved_order(tmp_path: Path) -> None:
     bundle = asyncio.run(
         run_phase2_investigation(case, gateway, _trace(tmp_path))  # type: ignore[arg-type]
     )
-    assert bundle["status"] == "stopped_no_resolved_order"
-    assert bundle["order_product"] is None
-    assert bundle["shipment"] is None
-    assert bundle["payment"] is None
+    assert bundle["status"] == "completed"
+    assert bundle["order_product"] is not None
+    assert bundle["shipment"] is not None
+    assert bundle["payment"] is not None
+    assert bundle["shipment"]["facts"]["verdict"] == "insufficient_evidence"
+    assert bundle["payment"]["facts"]["verdict"] == "insufficient_evidence"
     assert gateway.tools_called("get_order_items") == 0
     assert gateway.tools_called("get_shipment_summary") == 0
     assert gateway.tools_called("get_order_payments") == 0

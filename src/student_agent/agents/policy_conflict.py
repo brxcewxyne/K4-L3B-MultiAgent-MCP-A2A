@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..evidence import CaseState, consume_evidence
+from ..evidence import CaseState, consume_evidence, is_retryable_transport
 
 AGENT_NAME = "policy-conflict-agent"
 
@@ -270,10 +270,11 @@ def select_primary_issue(
         and "valid_split_payment" in topics
     ):
         primary = "valid_split_payment"
+    elif payment_verdict == "insufficient_evidence" and shipment_verdict == "insufficient_evidence":
+        # Missing evidence is unavailable evidence, never an unsupported claim.
+        primary = "insufficient_evidence"
     elif not supported_ids:
         primary = "unsupported_claim" if topics else "insufficient_evidence"
-    elif payment_verdict == "insufficient_evidence" and shipment_verdict == "insufficient_evidence":
-        primary = "insufficient_evidence"
     else:
         # Fall back to the first evidenced issue claim.
         primary = "insufficient_evidence"
@@ -701,6 +702,8 @@ async def run_policy_conflict_agent(
                 case_id=case_id, policy_version=policy_version.strip(),
             )
         except Exception as exc:  # noqa: BLE001 - degrade to needs_investigation
+            if is_retryable_transport(exc):
+                raise
             warnings.append(f"get_policy failed: {type(exc).__name__}")
         else:
             policy_ref = str(evidence["evidence_ref"])
@@ -753,9 +756,9 @@ async def run_policy_conflict_agent(
         "*": policy_refs,
     }
 
-    # GPT final semantic judge (normal path when available). Deterministic
-    # semantic mapping below runs ONLY as fallback, so deterministic rules
-    # never drive the outcome when GPT is available and compatible.
+    # GPT Final Judge (normal path when available). Deterministic semantic
+    # mapping below runs ONLY as explicit provider fallback, so deterministic
+    # rules never drive or overwrite the outcome when GPT is adopted.
     primary = ""
     secondary: list[str] = []
     assessments: list[dict[str, Any]] = []
@@ -766,6 +769,7 @@ async def run_policy_conflict_agent(
     verdict_overrides: dict[str, str] = {}
     review_needed = False
     review_disagreement = False
+    gpt_adopted = False
     semantic_source = "deterministic_fallback" if router is None else "provider_fallback"
     adopted_status: str | None = None
     if router is not None:
@@ -800,6 +804,7 @@ async def run_policy_conflict_agent(
             review_disagreement = True
         elif decision is not None:
             semantic_source = "gpt"
+            gpt_adopted = True
             primary = decision["primary_issue"]
             secondary = list(decision["secondary_issues"])
             adopted_status = decision["case_status"]
@@ -814,11 +819,11 @@ async def run_policy_conflict_agent(
             warnings.append("model-assisted policy decision adopted.")
         elif review_needed:
             review_disagreement = True
-    if semantic_source == "deterministic_fallback":
-        # Deterministic semantic fallback: mapping oracle for fallback
-        # results and input to the hard-compatibility guard. Never runs on
-        # the GPT-adopted path.
-        assessments = [
+    if not gpt_adopted:
+        # Conservative explicit provider fallback: deterministic semantic
+        # mapping. Schema-valid, no pretended certainty (calibration caps
+        # and penalties apply below). Also runs when no provider configured.
+        first_pass = [
             assess_claim(
                 claim,
                 shipment_verdict=shipment_verdict,
@@ -838,7 +843,7 @@ async def run_policy_conflict_agent(
             order_status=order_status,
             captured_total=captured_total,
             multi_row_reconciled=multi_row and payment_verdict == "reconciled",
-            claim_assessments=assessments,
+            claim_assessments=first_pass,
             claims=claims[:5],
         )
     rule = rules.get(primary)
@@ -863,28 +868,36 @@ async def run_policy_conflict_agent(
     else:
         case_status = "needs_investigation"
 
-    assessments = [
-        assess_claim(
-            claim,
-            shipment_verdict=shipment_verdict,
-            payment_verdict=payment_verdict,
-            recommended_refund=recommended,
-            remaining=remaining,
-            case_status_hint=case_status,
-            order_status=order_status,
-            multi_row_reconciled=multi_row and payment_verdict == "reconciled",
-            refs_for=refs_for,
-        )
-        for claim in claims[:5]
-    ]
-
-    for assessment in assessments:
-        override = verdict_overrides.get(assessment.get("claim_id", ""))
-        if override is not None and override != assessment["verdict"]:
-            assessment["verdict"] = override
-            assessment["confidence"] = round(
-                min(float(assessment.get("confidence", 0.0)), model_confidence or 0.0), 3
+    if gpt_adopted:
+        # Agent-driven path: claim verdicts come from GPT. Deterministic code
+        # supplies only IDs (claim_id), evidence_refs, and confidence caps.
+        assessments = []
+        for claim in claims[:5]:
+            claim_id = str(claim.get("claim_id", "unknown-claim"))
+            topic = str(claim.get("topic", ""))
+            domain_refs = refs_for.get(topic, refs_for.get("*", []))
+            verdict = verdict_overrides.get(claim_id, "insufficient_evidence")
+            assessments.append({
+                "claim_id": claim_id,
+                "verdict": verdict,
+                "confidence": round(float(model_confidence or 0.0), 3),
+                "evidence_refs": list(domain_refs),
+            })
+    else:
+        assessments = [
+            assess_claim(
+                claim,
+                shipment_verdict=shipment_verdict,
+                payment_verdict=payment_verdict,
+                recommended_refund=recommended,
+                remaining=remaining,
+                case_status_hint=case_status,
+                order_status=order_status,
+                multi_row_reconciled=multi_row and payment_verdict == "reconciled",
+                refs_for=refs_for,
             )
+            for claim in claims[:5]
+        ]
 
     for assessment, claim in zip(assessments, claims[:5], strict=True):
         topic = str(claim.get("topic", ""))
@@ -912,15 +925,21 @@ async def run_policy_conflict_agent(
                 "resolution_code": "policy_prevails",
             })
 
-    parties = adopted_parties or _responsible_parties(rule, evidenced_sellers)
-    if adopted_causes:
-        ranked = adopted_causes
+    parties = adopted_parties if gpt_adopted else _responsible_parties(rule, evidenced_sellers)
+    if gpt_adopted:
+        ranked = list(adopted_causes)
     else:
         ranked = [{"cause_code": primary.upper(), "rank": 1}]
         if secondary:
             ranked.append({"cause_code": secondary[0].upper(), "rank": 2})
 
-    recommended_code = adopted_action_code or (rule or {}).get("recommended_action")
+    recommended_code = adopted_action_code if gpt_adopted else (rule or {}).get(
+        "recommended_action"
+    )
+    if gpt_adopted and recommended_code is None:
+        # GPT chose no mapped remedy: fall back to the rule's deterministic
+        # action for schema validity, money still computed by Python.
+        recommended_code = (rule or {}).get("recommended_action")
     reason_code = str(recommended_code or primary)
     refund_lines: list[dict[str, Any]] = []
     if recommended > 0 and resolved:
@@ -929,12 +948,30 @@ async def run_policy_conflict_agent(
             "amount_brl": recommended,
             "entity_id": resolved[0],
         })
-    actions = build_resolution_actions(
-        recommended_action=recommended_code,
-        recommended_refund=recommended,
-        case_status=case_status,
-        shipment_verdict=shipment_verdict,
-    )
+    if gpt_adopted:
+        # GPT owns resolution actions: map its semantic codes only. Python
+        # formats money suffixes and enforces schema caps/dedupe.
+        actions = []
+        base = _ACTION_MAP.get(str(recommended_code or ""), "request_manual_review")
+        if base in ("issue_refund", "refund_duplicate_charge", "refund_freight"):
+            if recommended > 0:
+                actions.append(f"{base}_brl_{recommended:.2f}")
+            else:
+                actions.append("no_action_required_documented")
+        else:
+            actions.append(base)
+        seen_actions: list[str] = []
+        for action in actions:
+            if action not in seen_actions:
+                seen_actions.append(action)
+        actions = seen_actions[:8]
+    else:
+        actions = build_resolution_actions(
+            recommended_action=recommended_code,
+            recommended_refund=recommended,
+            case_status=case_status,
+            shipment_verdict=shipment_verdict,
+        )
 
     specialist_failed = any(
         (bundle.get(key) or {}).get("status") != "completed"
