@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -48,7 +49,6 @@ GPT_OUTPUT_PER_1K_USD = 0.0006
 ENTITY_MODEL_MIN_CONFIDENCE = 0.7
 LABEL_MODEL_MIN_CONFIDENCE = 0.7
 CONFLICT_MODEL_MIN_CONFIDENCE = 0.6
-POLICY_MODEL_MIN_CONFIDENCE = 0.75
 
 SYSTEM_RULES = (
     "Rules: use ONLY the supplied evidence summary. Uncertainty is allowed. "
@@ -58,6 +58,21 @@ SYSTEM_RULES = (
     "support certainty. Reply with a single JSON object, no prose, "
     "no chain-of-thought, no extra fields."
 )
+
+SEMANTIC_SYSTEM = (
+    "You decide the business meaning of an ecommerce dispute from normalized, "
+    "authoritative evidence. Use only the supplied normalized evidence. "
+    "Customer claims are allegations, not facts: authoritative evidence has "
+    "priority over claim wording. Do not invent IDs, evidence, events, or "
+    "amounts. If evidence contradicts a claim, mark the claim unsupported. "
+    "If evidence is incomplete, use insufficient_evidence. Distinguish "
+    "partially_supported from supported. Choose exactly one primary issue "
+    "from the allowed enum. Secondary issues must be independently "
+    "evidence-backed. Responsible parties must follow the evidence: use only "
+    "the given known party IDs or null. Return only structured output."
+)
+
+_CAUSE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 
 
 class ModelError(Exception):
@@ -284,6 +299,109 @@ def validate_policy_decision(raw: Any, claim_ids: list[str]) -> dict[str, Any] |
     }
 
 
+def validate_semantic_decision(
+    raw: Any, claim_ids: list[str], known_party_ids: list[str]
+) -> dict[str, Any] | None:
+    """Strict GPT semantic-decision schema.
+
+    Same closed vocabularies as policy decisions, but claim assessments,
+    parties, and causes travel as structured objects. Money, timestamps,
+    evidence refs, and new claims are structurally impossible: the schema
+    has no fields for them. Ranked causes must align with the chosen
+    primary/secondary issues.
+    """
+    if not isinstance(raw, dict) or set(raw) != {
+        "primary_issue", "secondary_issues", "case_status", "claim_assessments",
+        "responsible_parties", "ranked_causes", "resolution_action_codes",
+        "model_confidence",
+    }:
+        return None
+    confidence = _valid_confidence(raw.get("model_confidence"))
+    if confidence is None:
+        return None
+    primary = raw.get("primary_issue")
+    secondary = raw.get("secondary_issues")
+    status = raw.get("case_status")
+    assessments = raw.get("claim_assessments")
+    parties = raw.get("responsible_parties")
+    causes = raw.get("ranked_causes")
+    action_codes = raw.get("resolution_action_codes")
+    if primary not in PRIMARY_ISSUES:
+        return None
+    if (
+        not isinstance(secondary, list)
+        or len(secondary) > 10
+        or any(s not in PRIMARY_ISSUES for s in secondary)
+    ):
+        return None
+    if status not in CASE_STATUSES:
+        return None
+    if not isinstance(assessments, list) or len(assessments) > 5:
+        return None
+    seen_claims: set[str] = set()
+    for item in assessments:
+        if not isinstance(item, dict) or set(item) != {"claim_id", "verdict"}:
+            return None
+        claim_id, verdict = item.get("claim_id"), item.get("verdict")
+        if claim_id not in claim_ids or verdict not in CLAIM_VERDICTS:
+            return None
+        if claim_id in seen_claims:
+            return None
+        seen_claims.add(claim_id)
+    if not isinstance(parties, list) or not 1 <= len(parties) <= 5:
+        return None
+    known = set(known_party_ids)
+    for party in parties:
+        if not isinstance(party, dict) or set(party) != {"party_type", "party_id"}:
+            return None
+        if party.get("party_type") not in PARTY_TYPES:
+            return None
+        party_id = party.get("party_id")
+        if party_id is not None and (not isinstance(party_id, str) or party_id not in known):
+            return None
+    if not isinstance(causes, list) or not 1 <= len(causes) <= 5:
+        return None
+    aligned = {primary.upper()} | {s.upper() for s in secondary if isinstance(s, str)}
+    seen_ranks: set[int] = set()
+    for cause in causes:
+        if not isinstance(cause, dict) or set(cause) != {"cause_code", "rank"}:
+            return None
+        code, rank = cause.get("cause_code"), cause.get("rank")
+        if (
+            not isinstance(code, str)
+            or not _CAUSE_CODE_PATTERN.fullmatch(code)
+            or code not in aligned
+            or not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or not 1 <= rank <= 5
+            or rank in seen_ranks
+        ):
+            return None
+        seen_ranks.add(rank)
+    if not isinstance(action_codes, list) or len(action_codes) > 8:
+        return None
+    for code in action_codes:
+        if not isinstance(code, str) or not code or len(code) > 80:
+            return None
+    return {
+        "primary_issue": primary,
+        "secondary_issues": list(secondary),
+        "case_status": status,
+        "claim_assessments": [
+            {"claim_id": item["claim_id"], "verdict": item["verdict"]} for item in assessments
+        ],
+        "responsible_parties": [
+            {"party_type": party["party_type"], "party_id": party["party_id"]}
+            for party in parties
+        ],
+        "ranked_causes": [
+            {"cause_code": cause["cause_code"], "rank": cause["rank"]} for cause in causes
+        ],
+        "resolution_action_codes": list(action_codes),
+        "model_confidence": confidence,
+    }
+
+
 def _new_usage() -> dict[str, float]:
     return {
         "qwen_calls": 0,
@@ -333,6 +451,13 @@ class ReasoningRouter:
         except ModelError:
             return None
         return self.gpt_client
+
+    def gpt_available(self) -> bool:
+        """Structural availability only; never probes the network."""
+        try:
+            return bool(self.settings.gpt_configured)
+        except AttributeError:
+            return False
 
     async def _ask_qwen(self, system: str, user: str) -> dict[str, Any]:
         client = self._qwen()
@@ -452,5 +577,24 @@ class ReasoningRouter:
         self.usage["qwen_to_gpt_escalations"] += 1
         try:
             return validate_policy_decision(await self._ask_gpt(system, user), claim_ids)
+        except ModelError:
+            return None
+
+    async def decide_semantics_gpt_first(
+        self,
+        packet: dict[str, Any],
+        claim_ids: list[str],
+        known_party_ids: list[str],
+    ) -> dict[str, Any] | None:
+        """One GPT semantic-decision call; Qwen is bypassed by design.
+
+        The packet carries normalized facts only. Returns the validated
+        semantic decision or None on any failure. At most one GPT call.
+        """
+        user = json.dumps(packet, ensure_ascii=False, default=str)
+        try:
+            return validate_semantic_decision(
+                await self._ask_gpt(SEMANTIC_SYSTEM, user), claim_ids, known_party_ids
+            )
         except ModelError:
             return None

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..evidence import CaseState, consume_evidence
-from ..reasoning import POLICY_MODEL_MIN_CONFIDENCE
 
 AGENT_NAME = "policy-conflict-agent"
 
@@ -16,6 +15,42 @@ _SUPPORTABLE_TOPICS = {
     "canceled_order_paid", "unavailable_order_paid", "requested_full_refund",
     "unsupported_claim",
 }
+
+# Coarse issue families for topic-vs-evidence disagreement detection.
+# Remedy requests and verdicts of last resort carry no family.
+_ISSUE_FAMILIES = {
+    "late_delivery_seller": "shipment",
+    "late_delivery_logistics": "shipment",
+    "payment_mismatch": "payment",
+    "duplicate_charge": "payment",
+    "valid_split_payment": "payment",
+    "refund_pending": "payment",
+    "refund_failed": "payment",
+    "canceled_order_paid": "order_state",
+    "unavailable_order_paid": "order_state",
+    "requested_full_refund": "remedy",
+    "unsupported_claim": "none",
+    "insufficient_evidence": "none",
+}
+
+TOPIC_CONFLICT_PENALTY = 0.05
+REVIEW_DISAGREEMENT_PENALTY = 0.05
+
+
+def topic_evidence_conflict(topics: list[str], primary_issue: str) -> bool:
+    """True when a non-remedy claim topic sits in a different issue family
+    than the evidence-derived primary (insufficient primaries excluded:
+    undecided evidence cannot clearly support anything)."""
+    if primary_issue == "insufficient_evidence":
+        return False
+    primary_family = _ISSUE_FAMILIES.get(primary_issue, "none")
+    for topic in topics:
+        family = _ISSUE_FAMILIES.get(topic, "none")
+        if family == "none" or family == "remedy":
+            continue
+        if family != primary_family:
+            return True
+    return False
 
 
 def _claims(case: dict[str, Any]) -> list[dict[str, Any]]:
@@ -318,6 +353,8 @@ def calibrate_confidence(
     policy_ambiguous: bool = False,
     partial_evidence: bool = False,
     partial_claim: bool = False,
+    topic_evidence_conflict: bool = False,
+    review_disagreement: bool = False,
 ) -> float:
     """Evidence-quality confidence. Every penalty must be able to fire.
 
@@ -346,6 +383,10 @@ def calibrate_confidence(
         confidence -= 0.10
     if partial_claim:
         confidence -= 0.10
+    if topic_evidence_conflict:
+        confidence -= TOPIC_CONFLICT_PENALTY
+    if review_disagreement:
+        confidence -= REVIEW_DISAGREEMENT_PENALTY
     confidence = max(0.0, min(1.0, confidence))
     if entity_status == "ambiguous":
         confidence = min(confidence, 0.60)
@@ -460,83 +501,155 @@ def _compatible_with_facts(
     return primary in ("unsupported_claim", "insufficient_evidence")
 
 
-async def _model_review(
+_USAGE_ATTRIBUTE_KEYS = (
+    "qwen_calls",
+    "gpt_calls",
+    "qwen_failures",
+    "gpt_failures",
+    "qwen_to_gpt_escalations",
+    "gpt_input_tokens",
+    "gpt_output_tokens",
+    "estimated_gpt_cost",
+)
+
+
+def _usage_attributes(
+    router: Any | None, semantic_source: str | None = None
+) -> dict[str, str | int | float | bool | None]:
+    """Per-case model-usage diagnostics for the trace.
+
+    Counters only: no prompts, chain-of-thought, keys, raw model output,
+    or customer PII beyond IDs already present in trace events.
+    """
+    attributes: dict[str, str | int | float | bool | None] = {}
+    usage: Any = None
+    try:
+        usage = router.usage if router is not None else None
+    except AttributeError:
+        usage = None
+    for key in _USAGE_ATTRIBUTE_KEYS:
+        value = None
+        if usage is not None:
+            try:
+                raw = usage.get(key, 0)
+            except AttributeError:
+                raw = 0
+            if isinstance(raw, bool):
+                value = None
+            elif isinstance(raw, (int, float)):
+                value = raw
+        attributes[key] = value if value is not None else 0
+    if semantic_source is not None:
+        attributes["semantic_source"] = semantic_source
+    return attributes
+
+
+def _gpt_ready(router: Any) -> bool:
+    """GPT structural availability only; never probes the network."""
+    try:
+        available = router.gpt_available()
+    except AttributeError:
+        try:
+            available = router.settings.gpt_configured
+        except AttributeError:
+            return False
+    return bool(available)
+
+
+async def _gpt_semantic_review(
     *,
     router: Any,
-    assessments: list[dict[str, Any]],
-    primary: str,
-    secondary: list[str],
-    shipment_verdict: str,
-    payment_verdict: str,
-    order_status: str,
-    captured_total: float | None,
-    remaining: float | None,
+    case_id: str,
     claims: list[dict[str, Any]],
+    shipment_verdict: str,
+    late_seller_ids: list[str],
+    timeline_complete: bool,
+    payment_verdict: str,
+    captured_total: float | None,
+    refunded_total: float | None,
+    remaining: float | None,
+    order_status: str,
+    resolved: list[str],
     rules: dict[str, dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Escalate genuine semantic ambiguity to the hybrid router.
+    evidenced_sellers: list[str],
+    existing_conflicts: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """One GPT semantic-decision call; deterministic fallback otherwise.
 
-    Triggers (explicit signals only): deterministic primary is
-    insufficient_evidence while some claim is partial/undecided; shipment
-    sources conflict; several distinct issues are simultaneously supported;
-    any claim is partially supported; the granted entitlement differs
-    materially from the requested remedy; or the primary denies everything
-    while some claim remains undecided. Clean supported/unsupported outcomes
-    never consult a model.
+    Eligibility (broad by design): GPT configured, at least one resolved
+    order, captured payment totals known, and policy rules present. Cases
+    that cannot be resolved factually fall back deterministically.
+    Qwen is bypassed here; it remains available to other agents.
+
+    The packet carries normalized facts only — no raw MCP payloads, trace,
+    prompts, or keys. Money, IDs, refs, and timestamps stay deterministic;
+    GPT owns only the validated semantic fields. A fact-contradictory
+    decision is rejected wholesale in favor of the deterministic fallback.
+
+    Returns ``(decision, info)`` where decision is the validated semantic
+    decision (or None) and info reports ``needed``/``guard_rejected`` flags.
     """
-    verdicts = {a.get("verdict") for a in assessments}
+    eligible = (
+        _gpt_ready(router)
+        and bool(resolved)
+        and captured_total is not None
+        and bool(rules)
+    )
+    if not eligible:
+        return None, {"needed": False, "guard_rejected": False}
     topics = [str(c.get("topic", "")) for c in claims]
-    supported_topics = {
-        topics[i] for i, a in enumerate(assessments)
-        if a.get("verdict") in ("supported", "partially_supported") and i < len(topics)
-    } - {"requested_full_refund"}
-    multi = len(supported_topics) >= 2
-    partials = [a for a in assessments if a.get("verdict") == "partially_supported"]
-    entitlement = _rule_refund(rules.get(primary))
-    ask_present = "requested_full_refund" in topics
-    material_gap = (
-        ask_present
-        and remaining is not None
-        and entitlement > 0
-        and entitlement < remaining - 0.01
-    )
-    undecided_denial = (
-        primary == "unsupported_claim" and "insufficient_evidence" in verdicts
-    )
-    needs_model = (
-        (
-            primary == "insufficient_evidence"
-            and bool(verdicts & {"partially_supported", "insufficient_evidence"})
-            and bool(topics)
-        )
-        or shipment_verdict == "conflicting"
-        or multi
-        or bool(partials)
-        or material_gap
-        or undecided_denial
-    )
-    if not needs_model:
-        return None
-    complexity = "complex" if (
-        shipment_verdict == "conflicting" or multi or len(partials) >= 2
-    ) else "simple"
-    context = {
-        "deterministic_primary": primary,
-        "deterministic_secondary": list(secondary),
-        "shipment_verdict": shipment_verdict,
+    known_party_ids = [s for s in evidenced_sellers if isinstance(s, str)]
+    packet = {
+        "case_id": case_id,
         "claims": [{"claim_id": str(c.get("claim_id")), "topic": str(c.get("topic"))}
                    for c in claims],
-        "assessments": [
-            {"claim_id": a.get("claim_id"), "verdict": a.get("verdict")} for a in assessments
-        ],
+        "requested_remedy": (
+            "full_refund" if "requested_full_refund" in topics else "none"
+        ),
+        "resolved_order_ids": list(resolved),
+        "order_status": order_status,
+        "shipment": {
+            "verdict": shipment_verdict,
+            "late_seller_ids": [s for s in late_seller_ids if isinstance(s, str)],
+            "timeline_complete": bool(timeline_complete),
+        },
+        "payment": {
+            "verdict": payment_verdict,
+            "captured_total_brl": captured_total,
+            "refunded_total_brl": refunded_total,
+        },
+        "refund_state": (
+            payment_verdict
+            if payment_verdict in ("refund_pending", "refund_failed", "refunded")
+            else "none"
+        ),
+        "financial_facts": {
+            "captured_total_brl": captured_total,
+            "refunded_total_brl": refunded_total,
+            "refundable_total_brl": remaining,
+        },
         "policy_rules": rules,
+        "evidence_issue_candidates": _evidence_issue_order(
+            shipment_verdict=shipment_verdict,
+            payment_verdict=payment_verdict,
+            order_status=order_status,
+            captured_total=captured_total,
+        ),
+        "data_conflicts": [
+            {"field": str(c.get("field", "")), "resolution_code": str(c.get("resolution_code", ""))}
+            for c in existing_conflicts
+            if isinstance(c, dict)
+        ][:5],
+        "responsible_candidates": {"seller_ids": known_party_ids},
     }
     claim_ids = [str(c.get("claim_id", "")) for c in claims]
-    decision = await router.decide_policy(
-        context, claim_ids, complexity, min_confidence=POLICY_MODEL_MIN_CONFIDENCE
-    )
+    try:
+        decide = router.decide_semantics_gpt_first
+    except AttributeError:
+        return None, {"needed": True, "guard_rejected": False}
+    decision = await decide(packet, claim_ids, known_party_ids)
     if decision is None:
-        return None
+        return None, {"needed": True, "guard_rejected": False}
     if not _compatible_with_facts(
         decision["primary_issue"],
         shipment_verdict=shipment_verdict,
@@ -544,8 +657,8 @@ async def _model_review(
         order_status=order_status,
         captured_total=captured_total,
     ):
-        return None
-    return decision
+        return None, {"needed": True, "guard_rejected": True}
+    return decision, {"needed": True, "guard_rejected": False}
 
 
 async def run_policy_conflict_agent(
@@ -656,35 +769,48 @@ async def run_policy_conflict_agent(
     )
     model_confidence: float | None = None
     adopted_action_code: str | None = None
-    adopted_party_types: list[str] = []
+    adopted_parties: list[dict[str, Any]] = []
+    adopted_causes: list[dict[str, Any]] = []
     verdict_overrides: dict[str, str] = {}
+    review_needed = False
+    review_disagreement = False
+    semantic_source = "deterministic_fallback"
     if router is not None:
-        decision = await _model_review(
+        decision, review_info = await _gpt_semantic_review(
             router=router,
-            assessments=assessments,
-            primary=primary,
-            secondary=secondary,
-            shipment_verdict=shipment_verdict,
-            payment_verdict=payment_verdict,
-            order_status=order_status,
-            captured_total=captured_total,
-            remaining=remaining,
+            case_id=case_id,
             claims=claims[:5],
+            shipment_verdict=shipment_verdict,
+            late_seller_ids=list(shipment_facts.get("late_seller_ids", []) or []),
+            timeline_complete=bool(shipment_facts.get("timeline_complete", False)),
+            payment_verdict=payment_verdict,
+            captured_total=captured_total,
+            refunded_total=refunded_total,
+            remaining=remaining,
+            order_status=order_status,
+            resolved=resolved,
             rules=rules,
+            evidenced_sellers=evidenced_sellers,
+            existing_conflicts=list(state.conflicts),
         )
-        if decision is not None:
+        review_needed = bool(review_info.get("needed"))
+        if review_info.get("guard_rejected"):
+            review_disagreement = True
+        elif decision is not None:
+            semantic_source = "gpt"
             primary = decision["primary_issue"]
             secondary = list(decision["secondary_issues"])
             model_confidence = decision["model_confidence"]
-            for claim_id, verdict in decision["claim_verdicts"].items():
-                verdict_overrides[claim_id] = verdict
-            adopted_party_types = list(decision["responsible_party_types"])
+            for item in decision["claim_assessments"]:
+                verdict_overrides[item["claim_id"]] = item["verdict"]
+            adopted_parties = [dict(party) for party in decision["responsible_parties"]]
+            adopted_causes = [dict(cause) for cause in decision["ranked_causes"]]
             codes = [c for c in decision["resolution_action_codes"] if c in _ACTION_MAP]
             if codes:
                 adopted_action_code = codes[0]
-            for conflict_note in decision["semantic_conflicts"]:
-                warnings.append(f"model semantic conflict: {conflict_note}")
             warnings.append("model-assisted policy decision adopted.")
+        elif review_needed:
+            review_disagreement = True
     rule = rules.get(primary)
     entitlement = _rule_refund(rule)
     if rule is None:
@@ -754,15 +880,13 @@ async def run_policy_conflict_agent(
                 "resolution_code": "policy_prevails",
             })
 
-    parties = _responsible_parties(rule, evidenced_sellers)
-    if adopted_party_types and len(adopted_party_types) == len(parties):
-        parties = [
-            {**party, "party_type": party_type}
-            for party, party_type in zip(parties, adopted_party_types, strict=True)
-        ]
-    ranked = [{"cause_code": primary.upper(), "rank": 1}]
-    if secondary:
-        ranked.append({"cause_code": secondary[0].upper(), "rank": 2})
+    parties = adopted_parties or _responsible_parties(rule, evidenced_sellers)
+    if adopted_causes:
+        ranked = adopted_causes
+    else:
+        ranked = [{"cause_code": primary.upper(), "rank": 1}]
+        if secondary:
+            ranked.append({"cause_code": secondary[0].upper(), "rank": 2})
 
     recommended_code = adopted_action_code or (rule or {}).get("recommended_action")
     reason_code = str(recommended_code or primary)
@@ -804,6 +928,10 @@ async def run_policy_conflict_agent(
         policy_ambiguous=policy_ambiguous,
         partial_evidence=specialist_failed,
         partial_claim=any(a["verdict"] == "partially_supported" for a in assessments),
+        topic_evidence_conflict=topic_evidence_conflict(
+            [str(c.get("topic", "")) for c in claims[:5]], primary
+        ),
+        review_disagreement=review_disagreement,
     )
     state.conflicts.extend(new_conflicts)
     state.warnings.extend(warnings)
@@ -815,6 +943,7 @@ async def run_policy_conflict_agent(
         actor=AGENT_NAME,
         decision_code=primary,
         evidence_refs=[policy_ref] if policy_ref else None,
+        attributes=_usage_attributes(router, semantic_source),
     )
     return {
         "agent": AGENT_NAME,

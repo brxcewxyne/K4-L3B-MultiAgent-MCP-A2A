@@ -257,6 +257,25 @@ def test_strict_schemas_reject_garbage() -> None:
     assert validate_policy_decision(unknown_claim, ["c1"]) is None
 
 
+def test_semantic_schema_rejects_garbage() -> None:
+    from student_agent.reasoning import validate_semantic_decision
+
+    base = _valid_semantic_decision()
+    assert validate_semantic_decision(base, ["c1", "c2"], ["S1"]) is not None
+    bad_enum = dict(base, primary_issue="not_a_real_issue")
+    assert validate_semantic_decision(bad_enum, ["c1", "c2"], ["S1"]) is None
+    bad_cause = dict(base, ranked_causes=[{"cause_code": "whatever", "rank": 1}])
+    assert validate_semantic_decision(bad_cause, ["c1", "c2"], ["S1"]) is None
+    misaligned = dict(
+        base, ranked_causes=[{"cause_code": "DUPLICATE_CHARGE", "rank": 1}]
+    )
+    assert validate_semantic_decision(misaligned, ["c1", "c2"], ["S1"]) is None
+    no_parties = dict(base, responsible_parties=[])
+    assert validate_semantic_decision(no_parties, ["c1", "c2"], ["S1"]) is None
+    no_causes = dict(base, ranked_causes=[])
+    assert validate_semantic_decision(no_causes, ["c1", "c2"], ["S1"]) is None
+
+
 def test_model_cannot_change_money_and_verifier_guards() -> None:
     case = {"case_id": "CASE_001", "candidate_order_ids": ["O1"],
             "customer_request": {"claims": []}}
@@ -464,122 +483,297 @@ def _policy_state() -> Any:
     return state
 
 
-def _valid_policy_decision() -> dict[str, Any]:
+def _valid_semantic_decision() -> dict[str, Any]:
+    """New-schema GPT decision matching _policy_case/_policy_bundle facts."""
     return {
-        "primary_issue": "late_delivery_logistics", "secondary_issues": [],
+        "primary_issue": "late_delivery_logistics",
+        "secondary_issues": [],
         "case_status": "action_required",
-        "claim_verdicts": {"c1": "supported", "c2": "supported"},
-        "responsible_party_types": ["logistics_provider"],
+        "claim_assessments": [
+            {"claim_id": "c1", "verdict": "supported"},
+            {"claim_id": "c2", "verdict": "supported"},
+        ],
+        "responsible_parties": [{"party_type": "logistics_provider", "party_id": None}],
+        "ranked_causes": [{"cause_code": "LATE_DELIVERY_LOGISTICS", "rank": 1}],
         "resolution_action_codes": ["refund_freight"],
-        "semantic_conflicts": [], "model_confidence": 0.8,
+        "model_confidence": 0.8,
     }
 
 
-def test_policy_partial_claim_reaches_qwen(tmp_path: Path) -> None:
-    qwen = FakeQwen([_valid_policy_decision()])
-    gpt = FakeGpt()
+def test_gpt_enabled_sources_semantics_from_gpt(tmp_path: Path) -> None:
+    gpt = FakeGpt([_valid_semantic_decision()])
+    qwen = FakeQwen()
+    gateway = PolicyGateway(_POLICY_RULES)
     router = _router(qwen, gpt)
     result = asyncio.run(run_policy_conflict_agent(
-        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _policy_case(), _policy_state(), gateway,
         _trace(tmp_path), _policy_bundle(), router))
-    assert len(qwen.calls) == 1 and gpt.calls == []
+    assert qwen.calls == [] and len(gpt.calls) == 1
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
     by_id = {a["claim_id"]: a["verdict"] for a in result["facts"]["claim_assessments"]}
     assert by_id["c2"] == "supported"
-    assert "model-assisted policy decision adopted." in result["warnings"]
-
-
-def test_policy_clean_case_uses_zero_model_calls(tmp_path: Path) -> None:
-    case = _policy_case()
-    case["customer_request"] = {"claims": [
-        {"claim_id": "c1", "topic": "late_delivery_logistics"},
-    ]}
-    qwen, gpt = FakeQwen(), FakeGpt()
-    result = asyncio.run(run_policy_conflict_agent(
-        case, _policy_state(), PolicyGateway(_POLICY_RULES),
-        _trace(tmp_path), _policy_bundle(), _router(qwen, gpt)))
-    assert qwen.calls == [] and gpt.calls == []
-    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
-
-
-def test_policy_incompatible_primary_rejected(tmp_path: Path) -> None:
-    bad = _valid_policy_decision()
-    bad["primary_issue"] = "duplicate_charge"  # reconciled payment contradicts it
-    qwen = FakeQwen([bad])
-    router = _router(qwen, FakeGpt())
-    result = asyncio.run(run_policy_conflict_agent(
-        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
-        _trace(tmp_path), _policy_bundle(), router))
-    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
-    assert "model-assisted policy decision adopted." not in result["warnings"]
-
-
-def test_policy_low_confidence_escalates_to_gpt(tmp_path: Path) -> None:
-    low = _valid_policy_decision()
-    low["model_confidence"] = 0.5
-    qwen = FakeQwen([low])
-    gpt = FakeGpt([_valid_policy_decision()])
-    router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
-                             qwen_client=qwen, gpt_client=gpt)
-    result = asyncio.run(run_policy_conflict_agent(
-        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
-        _trace(tmp_path), _policy_bundle(), router))
-    assert len(gpt.calls) == 1
-    assert router.usage["qwen_to_gpt_escalations"] == 1
-    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
-
-
-def test_policy_gpt_invalid_falls_back(tmp_path: Path) -> None:
-    qwen = FakeQwen([ModelError("down")])
-    gpt = FakeGpt([{"primary_issue": "nope"}])
-    router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
-                             qwen_client=qwen, gpt_client=gpt)
-    result = asyncio.run(run_policy_conflict_agent(
-        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
-        _trace(tmp_path), _policy_bundle(), router))
-    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
-    assert result["facts"]["recommended_refund_brl"] == 16.0
-
-
-def _policy_decision_with_conf(confidence: float) -> dict[str, Any]:
-    decision = _valid_policy_decision()
-    decision["model_confidence"] = confidence
-    return decision
-
-
-def test_policy_qwen_076_accepted_without_gpt(tmp_path: Path) -> None:
-    qwen = FakeQwen([_policy_decision_with_conf(0.76)])
-    gpt = FakeGpt()
-    gateway = PolicyGateway(_POLICY_RULES)
-    result = asyncio.run(run_policy_conflict_agent(
-        _policy_case(), _policy_state(), gateway,
-        _trace(tmp_path), _policy_bundle(), _router(qwen, gpt)))
-    assert gpt.calls == []
-    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
     assert "model-assisted policy decision adopted." in result["warnings"]
     assert [call[0] for call in gateway.calls] == ["get_policy"]
 
 
-def test_policy_qwen_072_escalates_to_gpt(tmp_path: Path) -> None:
-    qwen = FakeQwen([_policy_decision_with_conf(0.72)])
-    gpt = FakeGpt([_valid_policy_decision()])
+def test_clean_case_gets_single_gpt_call(tmp_path: Path) -> None:
+    case = _policy_case()
+    case["customer_request"] = {"claims": [
+        {"claim_id": "c1", "topic": "late_delivery_logistics"},
+    ]}
+    decision = _valid_semantic_decision()
+    decision["claim_assessments"] = [{"claim_id": "c1", "verdict": "supported"}]
+    qwen, gpt = FakeQwen(), FakeGpt([decision])
+    result = asyncio.run(run_policy_conflict_agent(
+        case, _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), _router(qwen, gpt)))
+    assert qwen.calls == [] and len(gpt.calls) == 1
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+
+
+def test_policy_incompatible_primary_rejected(tmp_path: Path) -> None:
+    bad = _valid_semantic_decision()
+    bad["primary_issue"] = "duplicate_charge"  # reconciled payment contradicts it
+    gpt = FakeGpt([bad])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert "model-assisted policy decision adopted." not in result["warnings"]
+    assert result["confidence"] == 0.80
+
+
+def test_gpt_low_confidence_adopted_with_calibration(tmp_path: Path) -> None:
+    low = _valid_semantic_decision()
+    low["model_confidence"] = 0.5
+    gpt = FakeGpt([low])
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
+                             qwen_client=FakeQwen(), gpt_client=gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["confidence"] == 0.5
+
+
+def test_policy_gpt_invalid_falls_back(tmp_path: Path) -> None:
+    gpt = FakeGpt([{"primary_issue": "nope"}])
+    qwen = FakeQwen()
     router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
                              qwen_client=qwen, gpt_client=gpt)
     result = asyncio.run(run_policy_conflict_agent(
         _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
         _trace(tmp_path), _policy_bundle(), router))
-    assert len(gpt.calls) == 1
-    assert router.usage["qwen_to_gpt_escalations"] == 1
+    assert qwen.calls == []
     assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["facts"]["recommended_refund_brl"] == 16.0
+    assert result["confidence"] == 0.80
 
 
-def test_policy_gpt_failure_after_072_qwen_falls_back(tmp_path: Path) -> None:
-    qwen = FakeQwen([_policy_decision_with_conf(0.72)])
+def _agree_case() -> dict[str, Any]:
+    case = _policy_case()
+    case["customer_request"] = {"claims": [
+        {"claim_id": "c1", "topic": "late_delivery_logistics"},
+    ]}
+    return case
+
+
+def test_topic_agreement_applies_no_penalty(tmp_path: Path) -> None:
+    from student_agent.agents.policy_conflict import calibrate_confidence as cal
+
+    base = cal(entity_status="resolved", primary_issue="late_delivery_logistics",
+               missing_evidence=False)
+    flagged = cal(entity_status="resolved", primary_issue="late_delivery_logistics",
+                  missing_evidence=False, topic_evidence_conflict=True)
+    assert flagged == round(base - 0.05, 3)
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key=""),
+                             qwen_client=FakeQwen(), gpt_client=FakeGpt())
+    result = asyncio.run(run_policy_conflict_agent(
+        _agree_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["confidence"] == 0.95
+
+
+def test_topic_conflict_lowers_confidence_but_keeps_primary(tmp_path: Path) -> None:
+    case = _policy_case()
+    case["customer_request"] = {"claims": [
+        {"claim_id": "c1", "topic": "late_delivery_logistics"},
+        {"claim_id": "c9", "topic": "duplicate_charge"},
+    ]}
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key=""),
+                             qwen_client=FakeQwen(), gpt_client=FakeGpt())
+    result = asyncio.run(run_policy_conflict_agent(
+        case, _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["confidence"] == 0.80
+
+
+def test_insufficient_cap_dominates_conflict_penalty() -> None:
+    from student_agent.agents.policy_conflict import calibrate_confidence as cal
+
+    assert cal(entity_status="resolved", primary_issue="insufficient_evidence",
+               missing_evidence=True, topic_evidence_conflict=True) <= 0.45
+
+
+def test_reviewer_disagreement_lowers_confidence(tmp_path: Path) -> None:
+    adopted = _valid_semantic_decision()
+    adopted["model_confidence"] = 0.9
+    gpt_ok = FakeGpt([adopted])
+    router_ok = _router(FakeQwen(), gpt_ok)
+    clean = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router_ok))
+    bad = _valid_semantic_decision()
+    bad["primary_issue"] = "duplicate_charge"  # reconciled payment contradicts it
+    gpt_bad = FakeGpt([bad])
+    router_bad = _router(FakeQwen(), gpt_bad)
+    rejected = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router_bad))
+    assert rejected["facts"]["primary_issue"] == clean["facts"]["primary_issue"]
+    assert rejected["confidence"] < clean["confidence"]
+    assert clean["confidence"] == 0.9
+    assert rejected["confidence"] == 0.80
+
+
+def test_guard_rejection_keeps_deterministic_result(tmp_path: Path) -> None:
+    bad = _valid_semantic_decision()
+    bad["primary_issue"] = "duplicate_charge"  # reconciled payment contradicts it
+    gpt = FakeGpt([bad])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["confidence"] == 0.80
+
+
+def test_policy_decided_carries_usage_attributes(tmp_path: Path) -> None:
+    import json as _json
+
+    gpt = FakeGpt([_valid_semantic_decision()])
+    qwen = FakeQwen()
+    router = _router(qwen, gpt)
+    asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    path = tmp_path / "trace.jsonl"
+    events = [_json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    decided = [e for e in events if e.get("event_type") == "policy_decided"]
+    assert len(decided) == 1
+    attributes = decided[0].get("attributes", {})
+    for key in ("qwen_calls", "gpt_calls", "qwen_failures", "gpt_failures",
+                "qwen_to_gpt_escalations", "gpt_input_tokens", "gpt_output_tokens"):
+        assert isinstance(attributes.get(key), (int, float)), key
+    assert attributes["qwen_calls"] == 0 and attributes["gpt_calls"] == 1
+    assert attributes["semantic_source"] == "gpt"
+    blob = _json.dumps(events, ensure_ascii=False).lower()
+    assert "sk-test" not in blob and "sk-team" not in blob
+    assert "prompt" not in blob and "chain" not in blob
+
+
+def test_gpt_failure_falls_back_without_qwen(tmp_path: Path) -> None:
+    qwen = FakeQwen()
     gpt = FakeGpt([ModelError("down")])
     router = ReasoningRouter(settings=ModelSettings(openai_api_key="sk-test-key"),
                              qwen_client=qwen, gpt_client=gpt)
+    gateway = PolicyGateway(_POLICY_RULES)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), gateway,
+        _trace(tmp_path), _policy_bundle(), router))
+    assert qwen.calls == []
+    assert len(gpt.calls) == 1
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["facts"]["recommended_refund_brl"] == 16.0
+    assert "model-assisted policy decision adopted." not in result["warnings"]
+    assert [call[0] for call in gateway.calls] == ["get_policy"]
+
+
+def test_gpt_disabled_without_key_falls_back(tmp_path: Path) -> None:
+    gpt = FakeGpt([_valid_semantic_decision()])
+    router = ReasoningRouter(settings=ModelSettings(openai_api_key=""),
+                             qwen_client=FakeQwen(), gpt_client=gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert gpt.calls == []
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert result["facts"]["recommended_refund_brl"] == 16.0
+
+
+def test_gpt_secondary_party_action_adopted(tmp_path: Path) -> None:
+    decision = _valid_semantic_decision()
+    decision["secondary_issues"] = ["refund_pending"]
+    decision["responsible_parties"] = [{"party_type": "seller", "party_id": "S1"}]
+    decision["resolution_action_codes"] = ["reconcile_payment"]
+    gpt = FakeGpt([decision])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["secondary_issues"] == ["refund_pending"]
+    assert result["facts"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": "S1"}]
+    assert "reconcile_payment_records" in result["facts"]["resolution_actions"]
+
+
+def test_gpt_invented_party_id_rejected(tmp_path: Path) -> None:
+    decision = _valid_semantic_decision()
+    decision["responsible_parties"] = [{"party_type": "seller", "party_id": "S999"}]
+    gpt = FakeGpt([decision])
+    router = _router(FakeQwen(), gpt)
     result = asyncio.run(run_policy_conflict_agent(
         _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
         _trace(tmp_path), _policy_bundle(), router))
     assert result["facts"]["primary_issue"] == "late_delivery_logistics"
-    assert result["facts"]["recommended_refund_brl"] == 16.0
+    assert result["facts"]["responsible_parties"] == [
+        {"party_type": "logistics_provider", "party_id": None}]
     assert "model-assisted policy decision adopted." not in result["warnings"]
+
+
+def test_gpt_invented_claim_id_rejected(tmp_path: Path) -> None:
+    decision = _valid_semantic_decision()
+    decision["claim_assessments"] = [{"claim_id": "ghost", "verdict": "supported"}]
+    gpt = FakeGpt([decision])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    by_id = {a["claim_id"]: a["verdict"] for a in result["facts"]["claim_assessments"]}
+    assert set(by_id) == {"c1", "c2"}
+    assert "model-assisted policy decision adopted." not in result["warnings"]
+
+
+def test_gpt_invalid_enum_rejected(tmp_path: Path) -> None:
+    decision = _valid_semantic_decision()
+    decision["primary_issue"] = "not_a_real_issue"
+    gpt = FakeGpt([decision])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_logistics"
+    assert "model-assisted policy decision adopted." not in result["warnings"]
+
+
+def test_gpt_adoption_keeps_money_refs_and_mcp(tmp_path: Path) -> None:
+    gateway = PolicyGateway(_POLICY_RULES)
+    adopted = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), gateway,
+        _trace(tmp_path), _policy_bundle(),
+        _router(FakeQwen(), FakeGpt([_valid_semantic_decision()]))))
+    gateway_plain = PolicyGateway(_POLICY_RULES)
+    state_plain = _policy_state()
+    plain = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), state_plain, gateway_plain,
+        _trace(tmp_path), _policy_bundle(), None))
+    assert adopted["facts"]["recommended_refund_brl"] == plain["facts"]["recommended_refund_brl"]
+    assert adopted["facts"]["refund_lines"] == plain["facts"]["refund_lines"]
+    assert adopted["evidence_refs"] == plain["evidence_refs"]
+    assert [call[0] for call in gateway.calls] == ["get_policy"]
+    assert len(gateway.calls) == len(gateway_plain.calls) == 1

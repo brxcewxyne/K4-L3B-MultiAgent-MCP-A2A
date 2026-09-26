@@ -71,6 +71,91 @@ class FakeGateway:
         raise AssertionError(f"unexpected tool {tool_name}")
 
 
+def _ns_case(**overrides: Any) -> dict[str, Any]:
+    case: dict[str, Any] = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["O1"],
+        "customer_unique_id_hint": "customer-Y",
+    }
+    case.update(overrides)
+    return case
+
+
+def test_namespace_hint_confirmed_by_history(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        orders={"O1": {"customer_id": "customer-row-X"}},
+        histories={"customer-Y": {"customer_unique_id": "customer-Y",
+                                  "order_ids": ["O1"]}},
+    )
+    state = new_case_state(_ns_case())
+    result = asyncio.run(run_entity_customer_agent(
+        _ns_case(), state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "resolved"
+    assert result["entity"]["customer_unique_id"] == "customer-Y"
+    assert state.entity["customer_unique_id"] == "customer-Y"
+
+
+def test_namespace_hint_absent_uses_history_uid(tmp_path: Path) -> None:
+    case = {"case_id": "CASE_001", "candidate_order_ids": ["O1"]}
+    gateway = FakeGateway(
+        orders={"O1": {"customer_id": "customer-row-X"}},
+        histories={"customer-row-X": {"customer_unique_id": "customer-Z",
+                                      "order_ids": ["O1"]}},
+    )
+    state = new_case_state(case)
+    result = asyncio.run(run_entity_customer_agent(case, state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "resolved"
+    assert result["entity"]["customer_unique_id"] == "customer-Z"
+
+
+def test_namespace_history_without_uid_falls_back_to_order(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        orders={"O1": {"customer_id": "customer-row-X"}},
+        histories={"customer-Y": {"order_ids": ["O1"]}},
+    )
+    state = new_case_state(_ns_case())
+    result = asyncio.run(run_entity_customer_agent(
+        _ns_case(), state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "resolved"
+    assert result["entity"]["customer_unique_id"] == "customer-row-X"
+
+
+def test_namespace_history_failure_falls_back_safely(tmp_path: Path) -> None:
+    gateway = FakeGateway(orders={"O1": {"customer_unique_id": "C1"}}, histories={})
+    state = new_case_state(_ns_case(customer_unique_id_hint="C1"))
+    result = asyncio.run(run_entity_customer_agent(
+        _ns_case(customer_unique_id_hint="C1"), state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "resolved"
+    assert result["entity"]["customer_unique_id"] == "C1"
+
+
+def test_namespace_hint_disagreement_prefers_history(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        orders={"O1": {"customer_id": "customer-row-X"}},
+        histories={"customer-Y": {"customer_unique_id": "customer-W",
+                                  "order_ids": ["O1"]}},
+    )
+    state = new_case_state(_ns_case())
+    result = asyncio.run(run_entity_customer_agent(
+        _ns_case(), state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "resolved"
+    assert result["entity"]["customer_unique_id"] == "customer-W"
+
+
+def test_namespace_no_invented_or_transformed_ids(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        orders={"O1": {"customer_id": "customer-row-X"}},
+        histories={"customer-Y": {"customer_unique_id": "customer-Y",
+                                  "order_ids": ["O1"]}},
+    )
+    state = new_case_state(_ns_case())
+    result = asyncio.run(run_entity_customer_agent(
+        _ns_case(), state, gateway, _trace(tmp_path)))
+    emitted = result["entity"]["customer_unique_id"]
+    assert emitted in {"customer-Y", "customer-row-X"}
+    assert emitted == "customer-Y"
+
+
 def test_cache_same_args_one_call() -> None:
     state = new_case_state({"case_id": "CASE_001"})
     gateway = FakeGateway(orders={"O1": {"customer_unique_id": "C1"}})

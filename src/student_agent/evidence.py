@@ -56,8 +56,8 @@ class CaseState:
         default_factory=lambda: {"completed_agents": [], "failed_agents": []}
     )
     cache: dict[CacheKey, dict[str, Any]] = field(default_factory=dict)
-    call_stats: dict[str, int] = field(
-        default_factory=lambda: {"mcp_calls": 0, "cache_hits": 0}
+    call_stats: dict[str, Any] = field(
+        default_factory=lambda: {"mcp_calls": 0, "cache_hits": 0, "by_tool": {}}
     )
 
 
@@ -119,6 +119,8 @@ async def fetch_evidence(
     for attempt in range(attempts):
         try:
             state.call_stats["mcp_calls"] += 1
+            by_tool = state.call_stats.setdefault("by_tool", {})
+            by_tool[tool_name] = int(by_tool.get(tool_name, 0)) + 1
             evidence = await gateway.call(tool_name, case_id=case_id, **arguments)
         except ValueError:
             raise

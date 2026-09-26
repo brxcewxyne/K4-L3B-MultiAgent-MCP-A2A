@@ -323,6 +323,8 @@ def test_mocked_case_max_calls(tmp_path: Path) -> None:
 
 def test_calibration_fires_on_uncertainty(tmp_path: Path) -> None:
     output = _solve(_happy_case(), _happy_gateway(), tmp_path)
+    # Providers are disabled in unit tests, so GPT review is ineligible and
+    # the deterministic fallback applies with no model penalty.
     assert output["assessment"]["confidence"] == 0.85
     case = _happy_case()
     del case["policy_version"]
@@ -340,6 +342,7 @@ def test_call_stats_track_cache_hits(tmp_path: Path) -> None:
     asyncio.run(fetch_evidence(state, gateway, "get_order", case_id="CASE_001", order_id="O1"))
     assert state.call_stats["mcp_calls"] == 1
     assert state.call_stats["cache_hits"] == 1
+    assert state.call_stats["by_tool"] == {"get_order": 1}
 
 
 def test_refundable_is_remaining_not_recommended(tmp_path: Path) -> None:
@@ -414,6 +417,22 @@ def test_verifier_flags_refundable_above_remaining(tmp_path: Path) -> None:
     _, notes = run_verifier(output, _verified_state(tmp_path, case, output), case,
                             _trace(tmp_path))
     assert notes, "expected downgrade: refundable exceeded remaining funds"
+
+
+def test_output_refs_unique_trace_linked_and_counted(tmp_path: Path) -> None:
+    import json as _json
+
+    gateway = _happy_gateway()
+    output = _solve(_happy_case(), gateway, tmp_path)
+    refs = output["evidence_refs"]
+    assert len(refs) == len(set(refs))
+    events = [_json.loads(line) for line in (tmp_path / "trace.jsonl").read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    consumed = [e for e in events if e["event_type"] == "tool_result_consumed"]
+    linked = [r for e in consumed for r in (e.get("evidence_refs") or [])]
+    for ref in refs:
+        assert ref in linked
+    assert len(gateway.calls) == 6
 
 
 def test_assembler_merges_payment_references() -> None:

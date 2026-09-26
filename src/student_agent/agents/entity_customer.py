@@ -91,6 +91,22 @@ def customer_id_from_order_data(data: Any) -> str | None:
     return None
 
 
+def history_customer_unique_id(data: Any) -> str | None:
+    """Top-level history customer_unique_id only.
+
+    Never digs into nested order rows: their customer_id lives in the order
+    row namespace. Never invents or transforms IDs; returns the evidence
+    string verbatim or None.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("customer_unique_id", "customerUniqueId"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def order_ids_from_history_data(data: Any) -> set[str]:
     found: set[str] = set()
 
@@ -189,6 +205,7 @@ async def run_entity_customer_agent(
 
     history_order_ids: set[str] = set()
     history_customer: str | None = hint
+    history_exposed_uid: str | None = None
     if hint is None and len(distinct_customers) == 1:
         history_customer = next(iter(distinct_customers))
     if history_customer is not None and candidates:
@@ -209,6 +226,7 @@ async def run_entity_customer_agent(
             _emit_consumed(trace, case_id, "get_customer_history", evidence)
             state.facts["customer_history"][history_customer] = evidence.get("data")
             history_order_ids = order_ids_from_history_data(evidence.get("data"))
+            history_exposed_uid = history_customer_unique_id(evidence.get("data"))
             if state.entity.get("customer_unique_id") is None:
                 state.entity["customer_unique_id"] = history_customer
 
@@ -229,12 +247,18 @@ async def run_entity_customer_agent(
         status = "resolved"
         resolved = list(strong)
         confidence = 0.85 if hint is not None else 0.8
-        customer_unique_id = order_customers.get(resolved[0]) or history_customer
+        # Emission precedence: history-corroborated unique-ID namespace first,
+        # then the authoritative order row, then the case hint. The history
+        # value is used verbatim; IDs are never transformed or synthesized.
+        if history_exposed_uid is not None:
+            customer_unique_id = history_exposed_uid
+        else:
+            customer_unique_id = order_customers.get(resolved[0]) or history_customer
     elif len(strong) > 1:
         status = "ambiguous"
         resolved = []
         confidence = 0.45
-        customer_unique_id = hint
+        customer_unique_id = history_exposed_uid or hint
         conflicts.append({
             "field": "resolved_order_ids",
             "sources": list(strong),
