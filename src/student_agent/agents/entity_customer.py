@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from ..evidence import CaseState, fetch_evidence
+from ..evidence import CaseState, fetch_evidence, is_retryable_transport
 from ..reasoning import ENTITY_MODEL_MIN_CONFIDENCE
 
 AGENT_NAME = "entity-customer-agent"
@@ -182,8 +182,13 @@ async def run_entity_customer_agent(
                 state, gateway, "get_order", case_id=case_id, order_id=order_id
             )
         except Exception as exc:  # noqa: BLE001 - record partial failure, keep others
+            if is_retryable_transport(exc):
+                raise
             failed.append(order_id)
             warnings.append(f"get_order failed for {order_id}: {type(exc).__name__}")
+            state.mcp_failures.append(
+                {"tool": "get_order", "target": order_id, "error": type(exc).__name__}
+            )
             order_customers[order_id] = None
             continue
         ref = str(evidence["evidence_ref"])
@@ -218,7 +223,14 @@ async def run_entity_customer_agent(
                 customer_unique_id=history_customer,
             )
         except Exception as exc:  # noqa: BLE001 - history optional, degrade gracefully
+            if is_retryable_transport(exc):
+                raise
             warnings.append(f"get_customer_history failed: {type(exc).__name__}")
+            state.mcp_failures.append({
+                "tool": "get_customer_history",
+                "target": history_customer or "",
+                "error": type(exc).__name__,
+            })
         else:
             ref = str(evidence["evidence_ref"])
             if ref not in evidence_refs:

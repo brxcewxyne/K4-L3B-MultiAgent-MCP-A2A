@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import httpx2
+
 
 class GatewayProtocol(Protocol):
     """Minimal surface used by Phase 1. Matches EvidenceGateway.call."""
@@ -59,6 +61,7 @@ class CaseState:
     call_stats: dict[str, Any] = field(
         default_factory=lambda: {"mcp_calls": 0, "cache_hits": 0, "by_tool": {}}
     )
+    mcp_failures: list[dict[str, Any]] = field(default_factory=list)
 
 
 def new_case_state(case: dict[str, Any]) -> CaseState:
@@ -80,6 +83,21 @@ _TRANSIENT_MARKERS = (
 def _is_transient(message: str) -> bool:
     lowered = message.lower()
     return any(marker in lowered for marker in _TRANSIENT_MARKERS)
+
+
+def is_retryable_transport(exc: BaseException) -> bool:
+    """Single source of truth for retryable transport failures.
+
+    Matches transport-layer errors (timeouts, disconnects) including ones
+    wrapped in anyio task-group BaseExceptionGroups on session teardown.
+    Generic RuntimeError (e.g. MCP tool isError responses) and validation
+    errors are NOT retryable and must keep degrading gracefully.
+    """
+    if isinstance(exc, httpx2.TransportError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(is_retryable_transport(sub) for sub in exc.exceptions)
+    return False
 
 
 def register_evidence(state: CaseState, tool_name: str, evidence: dict[str, Any]) -> str:

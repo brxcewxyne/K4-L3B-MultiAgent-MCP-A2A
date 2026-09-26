@@ -13,7 +13,7 @@ from .agents.shipment import AGENT_NAME as SHIPMENT_AGENT
 from .agents.shipment import run_shipment_agent
 from .agents.verifier import AGENT_NAME as VERIFIER_AGENT
 from .agents.verifier import run_verifier
-from .assemble import assert_no_internal_leak, build_output, build_unresolved_output
+from .assemble import assert_no_internal_leak, build_output
 from .evidence import CaseState, new_case_state
 from .mcp_gateway import EvidenceGateway
 from .reasoning import ModelSettings, ReasoningRouter
@@ -69,10 +69,11 @@ async def run_phase2_investigation(
 ) -> dict[str, Any]:
     """Internal Phase-2 harness: entity resolution then specialist fan-out.
 
-    Runs order/product, shipment, and payment/refund sequentially after a
-    resolved order exists. Returns an internal bundle
-    (``state/phase1/order_product/shipment/payment``), never a submission
-    document. Stops the fan-out safely when no order resolved.
+    Runs order/product, shipment, and payment/refund sequentially, even when
+    no order resolved: each specialist then returns a structured
+    insufficient-evidence result instead of being skipped. Returns an
+    internal bundle (``state/phase1/order_product/shipment/payment``), never
+    a submission document.
     """
     if state is None or phase1 is None:
         state, phase1 = await run_phase1_entity_resolution(case, gateway, trace)
@@ -86,9 +87,6 @@ async def run_phase2_investigation(
         "payment": None,
         "status": "completed",
     }
-    if not resolved:
-        bundle["status"] = "stopped_no_resolved_order"
-        return bundle
     for agent_name, runner, key in (
         (ORDER_PRODUCT_AGENT, run_order_product_agent, "order_product"),
         (SHIPMENT_AGENT, run_shipment_agent, "shipment"),
@@ -119,21 +117,18 @@ async def solve_case(
 ) -> dict[str, Any]:
     """End-to-end case solver returning one ``day09-l3b-output-v2`` document.
 
-    Flow: entity resolution → (unresolved ? conservative output)
-    → specialists → policy/conflict → assemble → verify → return.
-    Emits ``policy_decided`` and ``verification_completed`` along the way.
-    Never fabricates evidence; verifier downgrades instead of repairing.
-    A per-case hybrid router interprets genuine semantic ambiguity;
-    deterministic rules and the verifier keep final authority.
+    Flow: entity resolution → specialists (always run, even unresolved) →
+    policy/conflict with Final Semantic Judge → assemble → verify → return.
+    Unresolved entity never finalizes the case early: downstream agents get
+    partial context and the judge still executes. Emits ``policy_decided``
+    and ``verification_completed`` along the way. Never fabricates evidence;
+    verifier downgrades instead of repairing. A per-case hybrid router
+    interprets genuine semantic ambiguity; deterministic rules and the
+    verifier keep final authority.
     """
     case_id = str(case.get("case_id", ""))
     router = build_router()
     state, phase1 = await run_phase1_entity_resolution(case, gateway, trace, router=router)
-    entity = phase1.get("entity", {})
-    if not entity.get("resolved_order_ids"):
-        output = build_unresolved_output(case, state, phase1)
-        return _verify_and_close(case_id, output, state, case, trace)
-
     bundle = await run_phase2_investigation(
         case, gateway, trace, state=state, phase1=phase1, router=router
     )

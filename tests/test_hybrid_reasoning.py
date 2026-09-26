@@ -6,6 +6,7 @@ No test here may touch real OpenAI, Ollama, or MCP.
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -777,3 +778,87 @@ def test_gpt_adoption_keeps_money_refs_and_mcp(tmp_path: Path) -> None:
     assert adopted["evidence_refs"] == plain["evidence_refs"]
     assert [call[0] for call in gateway.calls] == ["get_policy"]
     assert len(gateway.calls) == len(gateway_plain.calls) == 1
+
+
+def _dup_seller_bundle() -> dict[str, Any]:
+    """Bundle where deterministic precedence picks duplicate_charge but a
+    compatible late_delivery_seller GPT decision must win instead."""
+    bundle = _policy_bundle()
+    bundle["shipment"]["facts"] = {"verdict": "seller_delay", "late_seller_ids": ["S1"],
+                                   "timeline_complete": True}
+    bundle["payment"]["facts"] = {"verdict": "duplicate_capture",
+                                  "captured_total_brl": 220.0,
+                                  "refunded_total_brl": 0.0, "refundable_total_brl": None,
+                                  "timeline_called": ["O1"], "refund_called": []}
+    return bundle
+
+
+def _seller_decision() -> dict[str, Any]:
+    return {
+        "primary_issue": "late_delivery_seller",
+        "secondary_issues": ["duplicate_charge"],
+        "case_status": "action_required",
+        "claim_assessments": [
+            {"claim_id": "c1", "verdict": "supported"},
+            {"claim_id": "c2", "verdict": "supported"},
+        ],
+        "responsible_parties": [{"party_type": "seller", "party_id": "S1"}],
+        "ranked_causes": [
+            {"cause_code": "LATE_DELIVERY_SELLER", "rank": 1},
+            {"cause_code": "DUPLICATE_CHARGE", "rank": 2},
+        ],
+        "resolution_action_codes": ["refund_freight"],
+        "model_confidence": 0.8,
+    }
+
+
+def test_deterministic_mapping_does_not_override_gpt(tmp_path: Path) -> None:
+    """Deterministic precedence would pick duplicate_charge here; the
+    compatible GPT late_delivery_seller decision must win instead."""
+    gpt = FakeGpt([_seller_decision()])
+    router = _router(FakeQwen(), gpt)
+    result = asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _dup_seller_bundle(), router))
+    assert result["facts"]["primary_issue"] == "late_delivery_seller"
+    assert result["facts"]["secondary_issues"] == ["duplicate_charge"]
+    assert result["facts"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": "S1"}]
+    assert result["facts"]["ranked_causes"] == [
+        {"cause_code": "LATE_DELIVERY_SELLER", "rank": 1},
+        {"cause_code": "DUPLICATE_CHARGE", "rank": 2},
+    ]
+    assert "model-assisted policy decision adopted." in result["warnings"]
+
+
+def test_semantic_packet_has_no_deterministic_anchors(tmp_path: Path) -> None:
+    """The GPT packet must not leak deterministic semantic outputs, and issue
+    candidates must be neutrally ordered (not rule-precedence ordered)."""
+    gpt = FakeGpt([_valid_semantic_decision()])
+    router = _router(FakeQwen(), gpt)
+    asyncio.run(run_policy_conflict_agent(
+        _policy_case(), _policy_state(), PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), _policy_bundle(), router))
+    assert len(gpt.calls) == 1
+    payload = json.loads(gpt.calls[0][1])
+    forbidden = {
+        "deterministic_primary", "deterministic_secondary", "claim_verdicts",
+        "ranked_causes", "responsible_parties", "resolution_action_codes",
+        "primary_issue", "model_confidence", "claim_assessments",
+    }
+    assert not (forbidden & set(payload))
+    candidates = payload["evidence_issue_candidates"]
+    assert candidates == sorted(set(candidates))
+    # Multi-issue bundle: rule-precedence order would be
+    # ["duplicate_charge", "canceled_order_paid", ...]; neutral is sorted.
+    gpt2 = FakeGpt([_valid_semantic_decision()])
+    bundle = _dup_seller_bundle()
+    state = _policy_state()
+    state.facts["orders"]["O1"] = {"order_id": "O1", "order_status": "canceled"}
+    asyncio.run(run_policy_conflict_agent(
+        _policy_case(), state, PolicyGateway(_POLICY_RULES),
+        _trace(tmp_path), bundle, _router(FakeQwen(), gpt2)))
+    payload2 = json.loads(gpt2.calls[0][1])
+    assert payload2["evidence_issue_candidates"] == [
+        "canceled_order_paid", "duplicate_charge", "late_delivery_seller",
+    ]

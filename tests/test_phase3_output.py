@@ -288,6 +288,25 @@ def test_verifier_action_status_consistency(tmp_path: Path) -> None:
     assert fixed["assessment"]["case_status"] == "needs_investigation"
 
 
+def test_verifier_flags_line_total_mismatch(tmp_path: Path) -> None:
+    case, gateway = _happy_case(), _happy_gateway()
+    output = _solve(case, gateway, tmp_path)
+    assert output["financial_resolution"]["recommended_refund_brl"] > 0
+    output["financial_resolution"]["refund_lines"][0]["amount_brl"] += 1.0
+    fixed, notes = run_verifier(output, _verified_state(tmp_path, case, output), case,
+                                _trace(tmp_path))
+    assert any("line total" in note for note in notes)
+    assert fixed["assessment"]["case_status"] == "needs_investigation"
+
+
+def test_verifier_accepts_consistent_lines(tmp_path: Path) -> None:
+    case, gateway = _happy_case(), _happy_gateway()
+    output = _solve(case, gateway, tmp_path)
+    _, notes = run_verifier(output, _verified_state(tmp_path, case, output), case,
+                            _trace(tmp_path))
+    assert not [note for note in notes if "line total" in note]
+
+
 # --- Final output + trace ---
 
 

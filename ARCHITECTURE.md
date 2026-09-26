@@ -168,6 +168,11 @@ khớp primary/secondary). Output invalid bị reject, không bao giờ sửa.
 Schema của Model về cấu trúc đã loại trừ amounts, IDs lạ, evidence refs,
 timestamps, claims mới, và tool calls. Guard `_compatible_with_facts` còn
 reject mọi primary đã adopt mà mâu thuẫn hard verdicts.
+Packet gửi cho GPT chỉ chứa facts đã normalize (claims id+topic, verdicts,
+totals, order status, policy rules, candidates, conflicts, seller IDs) —
+không có deterministic primary/secondary, claim verdicts, pre-ranked causes,
+hay preselected party; `evidence_issue_candidates` là sorted set trung tính,
+không mang thứ tự precedence của rules cũ.
 
 ## 8. Điều kiện model-review chính xác (đúng như code)
 
@@ -176,7 +181,7 @@ reject mọi primary đã adopt mà mâu thuẫn hard verdicts.
 | Entity | `ambiguous` + >1 strong candidate, không có ranker tường minh | Qwen invalid/fails/low-confidence | selected ID ∈ strong set và confidence ≥ 0.7 |
 | Shipment | verdict `insufficient_evidence` có status text, hoặc `conflicting` | nguồn shipment mâu thuẫn, sau Qwen | verdict enum hợp lệ và confidence ≥ 0.7 (label) / 0.6 (conflict); verdict từ timestamp không bao giờ bị override |
 | Payment | status tokens không có known mark nào | không bao giờ (lifecycle conflict đã resolve deterministic thành `capture_mismatch`) | payment state hợp lệ và confidence ≥ 0.7; totals tính lại deterministic |
-| Policy | **GPT-first, Qwen bị bypass:** GPT configured + có resolved order + `captured_total` đã biết + policy rules tồn tại (hầu hết resolved case) | luôn là lựa chọn đầu (không qua Qwen) | `_compatible_with_facts` pass; claim overrides giữ refs/confidence-min deterministic; party IDs thuộc allowlist; action codes thuộc `_ACTION_MAP`; tiền tính lại deterministic từ rule của primary đã adopt |
+| Policy | **GPT-first, Qwen bị bypass:** GPT configured + có resolved order + `captured_total` đã biết + policy rules tồn tại (hầu hết resolved case) | luôn là lựa chọn đầu (một call duy nhất, không qua Qwen) | `_compatible_with_facts` pass; claim overrides giữ refs/confidence-min deterministic; party IDs thuộc allowlist; action codes thuộc `_ACTION_MAP`; tiền tính lại deterministic từ rule của primary đã adopt. Deterministic mapping (`select_primary_issue` + pass đầu `assess_claim`) chỉ chạy ở nhánh fallback, không bao giờ drive kết quả khi GPT đã adopt |
 
 Không Model nào chạy khi: outcome supported/unsupported sạch (entity/shipment/payment), entity authoritative đã resolved, shipment quyết bởi timestamp, lifecycle payment rõ ràng, order/product extraction. Provider outage → deterministic fallback cộng calibration penalty nhỏ khi review đã cần mà thất bại.
 
@@ -266,7 +271,7 @@ và verifier.
 
 | Failure | Budget / behavior | Trace |
 |---|---|---|
-| MCP transport error | reconnect, retry theo case, `MAX_CASE_RETRIES = 2`; rồi abort run (resume chạy tiếp sau) | events của attempt dở dang còn lại; `case_finalized` chỉ khi success |
+| MCP transport error | reconnect, retry theo case, `MAX_CASE_RETRIES = 2`; rồi abort run (resume chạy tiếp sau). Entity agent re-raise lỗi retryable (`is_retryable_transport` dùng chung với CLI) thay vì degrade, để CLI reconnect kịp kích hoạt; lỗi tool/data vẫn degrade | events của attempt dở dang còn lại; `case_finalized` chỉ khi success |
 | MCP tool error / invalid args | không retry lỗi semantic; Agent ghi warning, hạ cấp thành partial/failed result | `tool_result_consumed` chỉ khi success |
 | Qwen/Ollama failure | fallback sang GPT nếu có cấu hình, else deterministic (entity/shipment/payment) | usage failures counter |
 | GPT failure/invalid/không configured | conservative deterministic fallback + calibration penalty khi review đã cần | usage failures counter; `semantic_source` = `"deterministic_fallback"` |

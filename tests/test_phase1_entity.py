@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx2
+import pytest
+
 from student_agent.agents.entity_customer import run_entity_customer_agent
 from student_agent.contracts import Contracts
 from student_agent.evidence import fetch_evidence, new_case_state
@@ -303,3 +306,84 @@ def test_solve_case_returns_schema_valid_output(tmp_path: Path) -> None:
     assert output["case_id"] == "CASE_001"
     assert output["assessment"]["case_status"] == "needs_investigation"
     assert not {"agent", "facts", "warnings", "cache", "workflow", "registry"} & set(output)
+
+
+def _transport_error() -> httpx2.TransportError:
+    return httpx2.ReadTimeout("timed out", request=httpx2.Request("POST", "http://x"))
+
+
+class ExplodingGateway:
+    """Gateway failing every call with a caller-supplied exception."""
+
+    def __init__(self, make_exc: Any) -> None:
+        self._make_exc = make_exc
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.calls.append((tool_name, dict(arguments)))
+        raise self._make_exc()
+
+
+def test_transport_error_propagates_from_get_order(tmp_path: Path) -> None:
+    """Retryable transport failures must reach CLI reconnect, not degrade."""
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["O1"],
+        "customer_unique_id_hint": "C1",
+    }
+    gateway = ExplodingGateway(_transport_error)
+    state = new_case_state(case)
+    with pytest.raises(httpx2.TransportError):
+        asyncio.run(run_entity_customer_agent(case, state, gateway, _trace(tmp_path)))
+
+
+def test_transport_exception_group_propagates(tmp_path: Path) -> None:
+    """Anyio-style grouped transport failures must also propagate."""
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["O1"],
+        "customer_unique_id_hint": "C1",
+    }
+    gateway = ExplodingGateway(
+        lambda: BaseExceptionGroup("g", [_transport_error(), _transport_error()])
+    )
+    state = new_case_state(case)
+    with pytest.raises(BaseExceptionGroup):
+        asyncio.run(run_entity_customer_agent(case, state, gateway, _trace(tmp_path)))
+
+
+def test_generic_runtime_error_still_degrades(tmp_path: Path) -> None:
+    """Non-transport tool failures (e.g. MCP isError) keep degrading gracefully."""
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["O9"],
+        "customer_unique_id_hint": "C1",
+    }
+    gateway = FakeGateway(orders={}, histories={})
+    state = new_case_state(case)
+    result = asyncio.run(run_entity_customer_agent(case, state, gateway, _trace(tmp_path)))
+    assert result["entity"]["status"] == "not_found"
+    assert result["entity"]["resolved_order_ids"] == []
+
+
+def test_history_transport_failure_propagates(tmp_path: Path) -> None:
+    """Transport failure on the optional history lookup must propagate too."""
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["O1"],
+        "customer_unique_id_hint": "C1",
+    }
+
+    class HistoryExplodes(FakeGateway):
+        async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+            if tool_name == "get_customer_history":
+                raise _transport_error()
+            return await super().call(tool_name, case_id=case_id, **arguments)
+
+    gateway = HistoryExplodes(
+        orders={"O1": {"customer_unique_id": "C1"}},
+        histories={"C1": {"order_ids": ["O1"]}},
+    )
+    state = new_case_state(case)
+    with pytest.raises(httpx2.TransportError):
+        asyncio.run(run_entity_customer_agent(case, state, gateway, _trace(tmp_path)))

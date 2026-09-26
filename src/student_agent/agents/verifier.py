@@ -103,6 +103,23 @@ def run_verifier(
         financial["refund_lines"] = []
         fixed["financial_resolution"] = financial
         downgrade("refund exceeded captured amount; capped")
+    line_total = 0.0
+    lines_valid = True
+    for line in financial.get("refund_lines", []):
+        amount = line.get("amount_brl") if isinstance(line, dict) else None
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            lines_valid = False
+            break
+        line_total += float(amount)
+    recommended_now = financial.get("recommended_refund_brl", 0)
+    lines_match = (
+        isinstance(recommended_now, (int, float))
+        and not isinstance(recommended_now, bool)
+        and lines_valid
+        and abs(float(recommended_now) - line_total) <= 0.01
+    )
+    if not lines_match:
+        downgrade("recommended refund differs from refund line total")
     if financial.get("currency") != "BRL":
         financial["currency"] = "BRL"
         fixed["financial_resolution"] = financial

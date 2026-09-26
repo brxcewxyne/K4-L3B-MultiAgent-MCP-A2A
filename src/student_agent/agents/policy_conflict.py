@@ -573,12 +573,15 @@ async def _gpt_semantic_review(
     rules: dict[str, dict[str, Any]],
     evidenced_sellers: list[str],
     existing_conflicts: list[dict[str, Any]],
+    evidence_availability: dict[str, bool] | None = None,
+    mcp_failures: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """One GPT semantic-decision call; deterministic fallback otherwise.
 
-    Eligibility (broad by design): GPT configured, at least one resolved
-    order, captured payment totals known, and policy rules present. Cases
-    that cannot be resolved factually fall back deterministically.
+    Eligibility is deliberately broad: GPT configured means the judge runs,
+    even with unresolved entities or missing specialist evidence. Missing
+    facts travel explicitly in the packet (availability flags + failure
+    records) so the judge can choose insufficient_evidence itself.
     Qwen is bypassed here; it remains available to other agents.
 
     The packet carries normalized facts only — no raw MCP payloads, trace,
@@ -589,12 +592,7 @@ async def _gpt_semantic_review(
     Returns ``(decision, info)`` where decision is the validated semantic
     decision (or None) and info reports ``needed``/``guard_rejected`` flags.
     """
-    eligible = (
-        _gpt_ready(router)
-        and bool(resolved)
-        and captured_total is not None
-        and bool(rules)
-    )
+    eligible = _gpt_ready(router)
     if not eligible:
         return None, {"needed": False, "guard_rejected": False}
     topics = [str(c.get("topic", "")) for c in claims]
@@ -629,18 +627,27 @@ async def _gpt_semantic_review(
             "refundable_total_brl": remaining,
         },
         "policy_rules": rules,
-        "evidence_issue_candidates": _evidence_issue_order(
+        # Neutral factual possibilities: sorted set, so old rule precedence
+        # order cannot anchor the judge. Every entry still requires an
+        # authoritative verdict or terminal order state.
+        "evidence_issue_candidates": sorted(set(_evidence_issue_order(
             shipment_verdict=shipment_verdict,
             payment_verdict=payment_verdict,
             order_status=order_status,
             captured_total=captured_total,
-        ),
+        ))),
         "data_conflicts": [
             {"field": str(c.get("field", "")), "resolution_code": str(c.get("resolution_code", ""))}
             for c in existing_conflicts
             if isinstance(c, dict)
         ][:5],
         "responsible_candidates": {"seller_ids": known_party_ids},
+        "evidence_availability": dict(evidence_availability or {}),
+        "mcp_failures": [
+            {"tool": str(f.get("tool", "")), "target": str(f.get("target", ""))}
+            for f in (mcp_failures or [])
+            if isinstance(f, dict)
+        ][:5],
     }
     claim_ids = [str(c.get("claim_id", "")) for c in claims]
     try:
@@ -671,9 +678,11 @@ async def run_policy_conflict_agent(
 ) -> dict[str, Any]:
     """Interpret policy, assess claims, resolve conflicts, decide money.
 
-    Never refetches order/shipment/payment evidence; reads specialist facts.
-    An optional hybrid `router` settles genuine semantic ambiguity; money,
-    IDs, refs, and policy rule lookup stay deterministic.
+    Agent-first flow: normalized facts feed one GPT final semantic judge;
+    deterministic semantic mapping runs only as fallback when GPT is
+    unavailable, fails validation, or is guard-rejected. Never refetches
+    order/shipment/payment evidence; reads specialist facts. Money, IDs,
+    refs, timestamps, and policy rule lookup stay deterministic in all paths.
     """
     case_id = str(case.get("case_id", state.case_id))
     claims = _claims(case)
@@ -744,29 +753,12 @@ async def run_policy_conflict_agent(
         "*": policy_refs,
     }
 
-    assessments = [
-        assess_claim(
-            claim,
-            shipment_verdict=shipment_verdict,
-            payment_verdict=payment_verdict,
-            recommended_refund=0.0,
-            remaining=remaining,
-            case_status_hint=None,
-            order_status=order_status,
-            multi_row_reconciled=multi_row and payment_verdict == "reconciled",
-            refs_for=refs_for,
-        )
-        for claim in claims[:5]
-    ]
-    primary, secondary = select_primary_issue(
-        shipment_verdict=shipment_verdict,
-        payment_verdict=payment_verdict,
-        order_status=order_status,
-        captured_total=captured_total,
-        multi_row_reconciled=multi_row and payment_verdict == "reconciled",
-        claim_assessments=assessments,
-        claims=claims[:5],
-    )
+    # GPT final semantic judge (normal path when available). Deterministic
+    # semantic mapping below runs ONLY as fallback, so deterministic rules
+    # never drive the outcome when GPT is available and compatible.
+    primary = ""
+    secondary: list[str] = []
+    assessments: list[dict[str, Any]] = []
     model_confidence: float | None = None
     adopted_action_code: str | None = None
     adopted_parties: list[dict[str, Any]] = []
@@ -774,8 +766,16 @@ async def run_policy_conflict_agent(
     verdict_overrides: dict[str, str] = {}
     review_needed = False
     review_disagreement = False
-    semantic_source = "deterministic_fallback"
+    semantic_source = "deterministic_fallback" if router is None else "provider_fallback"
+    adopted_status: str | None = None
     if router is not None:
+        evidence_availability = {
+            "order": bool(state.facts.get("orders")),
+            "shipment": bool(state.facts.get("shipment")),
+            "payment": bool(state.facts.get("payment")),
+            "customer_history": bool(state.facts.get("customer_history")),
+            "policy": policy_data is not None,
+        }
         decision, review_info = await _gpt_semantic_review(
             router=router,
             case_id=case_id,
@@ -792,6 +792,8 @@ async def run_policy_conflict_agent(
             rules=rules,
             evidenced_sellers=evidenced_sellers,
             existing_conflicts=list(state.conflicts),
+            evidence_availability=evidence_availability,
+            mcp_failures=list(state.mcp_failures),
         )
         review_needed = bool(review_info.get("needed"))
         if review_info.get("guard_rejected"):
@@ -800,6 +802,7 @@ async def run_policy_conflict_agent(
             semantic_source = "gpt"
             primary = decision["primary_issue"]
             secondary = list(decision["secondary_issues"])
+            adopted_status = decision["case_status"]
             model_confidence = decision["model_confidence"]
             for item in decision["claim_assessments"]:
                 verdict_overrides[item["claim_id"]] = item["verdict"]
@@ -811,6 +814,33 @@ async def run_policy_conflict_agent(
             warnings.append("model-assisted policy decision adopted.")
         elif review_needed:
             review_disagreement = True
+    if semantic_source == "deterministic_fallback":
+        # Deterministic semantic fallback: mapping oracle for fallback
+        # results and input to the hard-compatibility guard. Never runs on
+        # the GPT-adopted path.
+        assessments = [
+            assess_claim(
+                claim,
+                shipment_verdict=shipment_verdict,
+                payment_verdict=payment_verdict,
+                recommended_refund=0.0,
+                remaining=remaining,
+                case_status_hint=None,
+                order_status=order_status,
+                multi_row_reconciled=multi_row and payment_verdict == "reconciled",
+                refs_for=refs_for,
+            )
+            for claim in claims[:5]
+        ]
+        primary, secondary = select_primary_issue(
+            shipment_verdict=shipment_verdict,
+            payment_verdict=payment_verdict,
+            order_status=order_status,
+            captured_total=captured_total,
+            multi_row_reconciled=multi_row and payment_verdict == "reconciled",
+            claim_assessments=assessments,
+            claims=claims[:5],
+        )
     rule = rules.get(primary)
     entitlement = _rule_refund(rule)
     if rule is None:
@@ -826,7 +856,9 @@ async def run_policy_conflict_agent(
         refundable = round(remaining, 2)
         recommended = round(min(entitlement, remaining), 2)
     rule_status = (rule or {}).get("case_status")
-    if rule_status in ("action_required", "no_action", "needs_investigation"):
+    if adopted_status is not None:
+        case_status = adopted_status
+    elif rule_status in ("action_required", "no_action", "needs_investigation"):
         case_status = rule_status
     else:
         case_status = "needs_investigation"

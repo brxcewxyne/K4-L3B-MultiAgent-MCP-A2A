@@ -7,11 +7,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import httpx2
-
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
+from .evidence import is_retryable_transport
 from .mcp_gateway import EvidenceGateway, connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
@@ -52,13 +51,9 @@ def _has_valid_output(path: Path, case_id: str, contracts: Contracts) -> bool:
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """Transport-level failures only. Observed live wrapped in anyio
-    BaseExceptionGroups on session teardown, so unwrap groups recursively."""
-    if isinstance(exc, httpx2.TransportError):
-        return True
-    if isinstance(exc, BaseExceptionGroup):
-        return bool(exc.exceptions) and all(_is_transient(sub) for sub in exc.exceptions)
-    return False
+    """Transport-level failures only. Delegates to the shared helper in
+    evidence.py so agents and CLI classify retryability identically."""
+    return is_retryable_transport(exc)
 
 
 async def _solve_and_store(

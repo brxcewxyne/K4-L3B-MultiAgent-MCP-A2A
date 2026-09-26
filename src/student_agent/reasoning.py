@@ -553,33 +553,6 @@ class ReasoningRouter:
         except ModelError:
             return None
 
-    async def decide_policy(
-        self, context: dict[str, Any], claim_ids: list[str], complexity: str = "simple",
-        min_confidence: float = 0.0,
-    ) -> dict[str, Any] | None:
-        """Policy decision with strict schema. Qwen first; GPT when the case is
-        complex, Qwen fails, or Qwen is valid but below min_confidence.
-        Returns validated decision or None."""
-        user = json.dumps(context, ensure_ascii=False, default=str)
-        system = (
-            "Decide the dispute outcome from normalized case facts, claims, and "
-            "policy rules. Select primary/secondary issues, case status, per-claim "
-            "verdicts, responsible party types, and resolution action codes. "
-            + SYSTEM_RULES
-        )
-        _ = complexity
-        try:
-            decided = validate_policy_decision(await self._ask_qwen(system, user), claim_ids)
-            if decided is not None and decided["model_confidence"] >= min_confidence:
-                return decided
-        except ModelError:
-            pass
-        self.usage["qwen_to_gpt_escalations"] += 1
-        try:
-            return validate_policy_decision(await self._ask_gpt(system, user), claim_ids)
-        except ModelError:
-            return None
-
     async def decide_semantics_gpt_first(
         self,
         packet: dict[str, Any],
